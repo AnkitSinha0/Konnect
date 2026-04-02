@@ -1,0 +1,139 @@
+# ===================================
+# Konnect Project - Root .gitignore
+# ===================================
+
+# Environment Variables & Configuration
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+.env.staging
+.env.test
+
+# Secrets & API Keys
+secrets/
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+config/secrets.js
+config/secrets.json
+
+# Service-specific .env files (extra protection)
+services/*/.env
+services/*/.env.*
+
+# Node.js Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# Runtime & Cache
+*.pid
+*.seed
+*.pid.lock
+.npm
+.cache/
+.eslintcache
+.yarn-integrity
+
+# Build Outputs
+dist/
+build/
+coverage/
+*.tgz
+*.tar.gz
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Docker
+.dockerignore
+docker-compose.override.yml
+docker-compose.override.yaml
+*.dockerfile.local
+docker-volumes/
+docker-data/
+
+# Database
+*.sqlite
+*.sqlite3
+*.db
+db-data/
+mongo-data/
+postgres-data/
+redis-data/
+
+# IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+.vs/
+
+# OS Generated
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Temporary Files
+tmp/
+temp/
+.tmp/
+.temp/
+
+# Package Manager Locks (keep package.json but can ignore locks for Docker)
+# Uncomment if you want to ignore lock files:
+# package-lock.json
+# yarn.lock
+
+# Service-specific ignores
+services/*/node_modules/
+services/*/.env
+services/*/dist/
+services/*/build/
+services/*/coverage/
+services/*/*.log
+
+# Frontend specific
+frontend/.next/
+frontend/out/
+frontend/.vercel/
+
+# Testing
+test-results/
+coverage/
+.nyc_output/
+
+# Backup files
+*.backup
+*.bak
+*.tmp
+
+# Runtime configuration
+pm2.config.js
+ecosystem.config.js
+
+# Cloud deployment
+.serverless/
+.firebase/
+.kubectl/

@@ -1,0 +1,143 @@
+version: '3.8'
+
+services:
+  # Traefik API Gateway
+  traefik:
+    image: traefik:v3.0
+    container_name: konnect-traefik
+    command:
+      # Disable Docker provider since it's not working
+      - --providers.docker=false
+      # Add file provider for static config
+      - --providers.file.filename=/tmp/dynamic.yml
+      - --providers.file.watch=true
+      # Entry points
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      # API and dashboard
+      - --api.dashboard=true
+      - --api.insecure=true
+      # Logging
+      - --log.level=INFO
+      - --accesslog=true
+    ports:
+      - "80:80"           # HTTP traffic
+      - "443:443"         # HTTPS traffic
+      - "8080:8080"       # Traefik dashboard
+    volumes:
+      - D:/XEAE01/Konnect/traefik-config.yml:/tmp/dynamic.yml:ro
+    networks:
+      - konnect-network
+    restart: unless-stopped
+    labels:
+      # Dashboard routing
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=Host(`traefik.localhost`) || PathPrefix(`/api`) || PathPrefix(`/dashboard`)"
+      - "traefik.http.routers.dashboard.service=api@internal"
+
+  # Auth Service - connects to cloud MongoDB, Redis, RabbitMQ
+  auth-service:
+    build:
+      context: ./services/auth-service
+      dockerfile: Dockerfile
+    env_file:
+      - ./services/auth-service/.env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - konnect-network
+    labels:
+      # Enable Traefik
+      - "traefik.enable=true"
+      # HTTP routing
+      - "traefik.http.routers.auth-service.rule=PathPrefix(`/auth`)"
+      - "traefik.http.routers.auth-service.entrypoints=web"
+      # Service configuration
+      - "traefik.http.services.auth-service.loadbalancer.server.port=3002"
+      # Strip prefix middleware
+      - "traefik.http.middlewares.auth-strip-prefix.stripprefix.prefixes=/auth"
+      - "traefik.http.routers.auth-service.middlewares=auth-strip-prefix"
+      # Health check middleware
+      - "traefik.http.middlewares.auth-healthcheck.healthcheck.path=/health"
+
+  # Email Service - connects to cloud RabbitMQ and Resend API (Message Consumer - No HTTP Server)
+  email-service:
+    build:
+      context: ./services/email-service
+      dockerfile: Dockerfile
+    env_file:
+      - ./services/email-service/.env
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "node.*server.js"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - konnect-network
+    # No Traefik labels - this is a background message consumer service
+
+  # Chat Service - HTTP API for messages and conversations
+  chat-service:
+    build:
+      context: ./services/chat-service
+      dockerfile: Dockerfile
+    env_file:
+      - ./services/chat-service/.env
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3003/health', res => process.exit(res.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - konnect-network
+    depends_on:
+      - auth-service
+    labels:
+      # Enable Traefik
+      - "traefik.enable=true"
+      # HTTP routing
+      - "traefik.http.routers.chat-service.rule=PathPrefix(`/api`)"
+      - "traefik.http.routers.chat-service.entrypoints=web"
+      # Service configuration
+      - "traefik.http.services.chat-service.loadbalancer.server.port=3003"
+
+  # WebSocket Gateway - Real-time messaging layer
+  websocket-gateway:
+    build:
+      context: ./services/websocket-gateway
+      dockerfile: Dockerfile
+    env_file:
+      - ./services/websocket-gateway/.env
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3004/health', res => process.exit(res.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - konnect-network
+    depends_on:
+      - chat-service
+    labels:
+      # Enable Traefik
+      - "traefik.enable=true"
+      # WebSocket routing
+      - "traefik.http.routers.websocket-gateway.rule=PathPrefix(`/ws`)"
+      - "traefik.http.routers.websocket-gateway.entrypoints=web"
+      # Service configuration
+      - "traefik.http.services.websocket-gateway.loadbalancer.server.port=3004"
+
+# Custom network
+networks:
+  konnect-network:
+    driver: bridge
