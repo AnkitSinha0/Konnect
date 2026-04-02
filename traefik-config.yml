@@ -1,0 +1,57 @@
+http:
+  routers:
+    auth-service-router:
+      rule: "PathPrefix(`/auth`)"
+      service: "auth-service"
+      entryPoints:
+        - "web"
+      middlewares:
+        - "auth-strip-prefix"
+    
+    chat-service-router:
+      rule: "PathPrefix(`/api`)"
+      service: "chat-service"
+      entryPoints:
+        - "web"
+      middlewares:
+        - "api-strip-prefix"
+    
+    websocket-gateway-router:
+      rule: "PathPrefix(`/ws`)"
+      service: "websocket-gateway"
+      entryPoints:
+        - "web"
+      middlewares:
+        - "ws-strip-prefix"
+  
+  middlewares:
+    auth-strip-prefix:
+      stripPrefix:
+        prefixes:
+          - "/auth"
+    
+    api-strip-prefix:
+      stripPrefix:
+        prefixes:
+          - "/api"
+    
+    ws-strip-prefix:
+      stripPrefix:
+        prefixes:
+          - "/ws"
+  
+  services:
+    auth-service:
+      loadBalancer:
+        servers:
+          - url: "http://konnect-auth-service-1:3002"
+    
+    chat-service:
+      loadBalancer:
+        servers:
+          - url: "http://konnect-chat-service-1:3003"
+    
+    websocket-gateway:
+      loadBalancer:
+        servers:
+          - url: "http://konnect-websocket-gateway-1:3004"
