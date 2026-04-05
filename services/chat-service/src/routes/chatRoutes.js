@@ -7,7 +7,11 @@ const {
   getConversations,
   createDirectConversation,
   createGroupConversation,
-  updateMessageStatus
+  updateMessageStatus,
+  joinGroupByCode,
+  previewGroupByCode,
+  generateGroupQR,
+  regenerateInviteCode
 } = require('../controllers/chatController');
 
 // Apply authentication to all routes
@@ -22,5 +26,11 @@ router.patch('/messages/:messageId/status', updateMessageStatus);
 router.get('/conversations', getConversations);
 router.post('/conversations/direct', createDirectConversation);
 router.post('/conversations/group', createGroupConversation);
+
+// Group join routes
+router.post('/groups/join', joinGroupByCode);
+router.get('/groups/preview/:code', previewGroupByCode);
+router.get('/groups/:groupId/qr', generateGroupQR);
+router.post('/groups/:groupId/regenerate-code', regenerateInviteCode);
 
 module.exports = router;

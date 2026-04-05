@@ -38,6 +38,26 @@ const conversationSchema = new mongoose.Schema({
   avatar: {
     type: String
   },
+  // Group invite system
+  inviteCode: {
+    type: String,
+    unique: true,
+    sparse: true, // Only for groups
+    default: function() {
+      if (this.type === 'group') {
+        const { nanoid } = require('nanoid');
+        return 'KG' + nanoid(8);
+      }
+      return undefined;
+    }
+  },
+  inviteLink: {
+    type: String
+  },
+  allowInvites: {
+    type: Boolean,
+    default: true
+  },
   // Last message info for conversation list
   lastMessage: {
     content: String,

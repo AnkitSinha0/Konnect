@@ -1,17 +1,13 @@
 const Message = require('../models/Message');
 const Conversation = require('../models/Conversation');
-const redis = require('redis');
+const User = require('../models/User');
 
+// Redis client will be passed from server.js or imported from a shared module
 let redisClient;
 
-// Initialize Redis client
-const initRedis = async () => {
-  if (!redisClient) {
-    redisClient = redis.createClient({ url: process.env.REDIS_URL });
-    redisClient.on('error', (err) => console.log('Redis Client Error', err));
-    await redisClient.connect();
-  }
-  return redisClient;
+// Function to set Redis client from server.js
+const setRedisClient = (client) => {
+  redisClient = client;
 };
 
 /**
@@ -65,12 +61,15 @@ const sendMessage = async (req, res) => {
     };
     await conversation.save();
     
-    // Populate sender info for response
-    await message.populate('senderId', 'name email avatar');
-    
-    // Emit to Redis Pub/Sub for real-time delivery (skip if Redis not available)
+    // Emit to Redis Pub/Sub for real-time delivery
     try {
-      await initRedis();
+      // Use global redisClient from server.js
+      if (!redisClient) {
+        const redis = require('redis');
+        redisClient = redis.createClient({ url: process.env.REDIS_URL });
+        redisClient.on('error', (err) => console.log('Redis Client Error', err));
+        await redisClient.connect();
+      }
       
       const eventData = {
         messageId: message._id,
@@ -80,8 +79,8 @@ const sendMessage = async (req, res) => {
         messageType,
         timestamp: message.createdAt,
         senderInfo: {
-          name: message.senderId.name,
-          avatar: message.senderId.avatar
+          name: req.userName || req.userEmail || senderId,
+          avatar: null
         }
       };
       
@@ -93,6 +92,7 @@ const sendMessage = async (req, res) => {
         if (receiverId) {
           eventData.receiverId = receiverId;
           await redisClient.publish('chat.message', JSON.stringify(eventData));
+          console.log(`📡 Published 1:1 message to Redis: ${senderId} -> ${receiverId}`);
         }
       } else {
         // Group chat
@@ -101,9 +101,11 @@ const sendMessage = async (req, res) => {
           .filter(id => id !== senderId.toString());
         
         await redisClient.publish('chat.group.message', JSON.stringify(eventData));
+        console.log(`📡 Published group message to Redis: conversation ${conversationId}`);
       }
     } catch (redisError) {
-      console.log('⚠️  Redis pub/sub disabled:', redisError.message);
+      console.error('❌ Redis pub/sub failed:', redisError.message);
+      // Continue anyway - message is still saved to database
     }
     
     res.status(201).json({
@@ -157,7 +159,7 @@ const getMessages = async (req, res) => {
         { expiresAt: { $gt: new Date() } }
       ]
     })
-    .populate('senderId', 'name email avatar')
+    .populate({ path: 'senderId', select: 'name email avatar', model: User })
     .sort({ createdAt: -1 })
     .skip(skip)
     .limit(parseInt(limit));
@@ -201,8 +203,8 @@ const getConversations = async (req, res) => {
       'participants.userId': userId,
       'participants.leftAt': null
     })
-    .populate('participants.userId', 'name email avatar')
-    .populate('lastMessage.senderId', 'name email avatar')
+    .populate({ path: 'participants.userId', select: 'name email avatar', model: User })
+    .populate({ path: 'lastMessage.senderId', select: 'name email avatar', model: User })
     .sort({ 'lastMessage.timestamp': -1, updatedAt: -1 })
     .skip(skip)
     .limit(parseInt(limit));
@@ -215,7 +217,7 @@ const getConversations = async (req, res) => {
     // Transform data for frontend
     const conversationsData = conversations.map(conv => {
       const participant = conv.participants.find(p => 
-        p.userId._id.toString() === userId.toString()
+        p.userId && p.userId._id && p.userId._id.toString() === userId.toString()
       );
       
       let displayInfo = {};
@@ -223,13 +225,14 @@ const getConversations = async (req, res) => {
       if (conv.type === 'direct') {
         // For 1:1 chat, show other participant's info
         const otherParticipant = conv.participants.find(p => 
-          p.userId._id.toString() !== userId.toString() && !p.leftAt
+          p.userId && p.userId._id && p.userId._id.toString() !== userId.toString() && !p.leftAt
         );
         
         if (otherParticipant) {
           displayInfo = {
             name: otherParticipant.userId.name,
             avatar: otherParticipant.userId.avatar,
+            otherUserId: otherParticipant.userId._id?.toString(),
             isOnline: false // Will be populated by presence service
           };
         }
@@ -251,7 +254,7 @@ const getConversations = async (req, res) => {
           timestamp: conv.lastMessage.timestamp,
           senderName: conv.lastMessage.senderId?.name,
           messageType: conv.lastMessage.messageType,
-          isOwnMessage: conv.lastMessage.senderId?._id.toString() === userId.toString()
+          isOwnMessage: conv.lastMessage.senderId?._id?.toString() === userId.toString()
         } : null,
         unreadCount: 0, // TODO: Implement unread count
         isPremium: conv.isPremium,
@@ -408,11 +411,216 @@ const updateMessageStatus = async (req, res) => {
   }
 };
 
+/**
+ * Join a group by invite code
+ * POST /groups/join
+ */
+const joinGroupByCode = async (req, res) => {
+  try {
+    const { inviteCode } = req.body;
+    const userId = req.userId;
+    
+    if (!inviteCode) {
+      return res.status(400).json({ error: 'Invite code is required' });
+    }
+    
+    // Find conversation by invite code
+    const conversation = await Conversation.findOne({ 
+      inviteCode,
+      type: 'group',
+      allowInvites: true
+    });
+    
+    if (!conversation) {
+      return res.status(404).json({ error: 'Invalid invite code or group not found' });
+    }
+    
+    // Check if user is already a participant
+    const existingParticipant = conversation.participants.find(
+      p => p.userId.toString() === userId.toString() && !p.leftAt
+    );
+    
+    if (existingParticipant) {
+      return res.status(409).json({ error: 'You are already a member of this group' });
+    }
+    
+    // Add user to group
+    conversation.participants.push({
+      userId,
+      role: 'member',
+      joinedAt: new Date()
+    });
+    
+    await conversation.save();
+    await conversation.populate({ path: 'participants.userId', select: 'name email username', model: User });
+    
+    // Create join message
+    const joinMessage = new Message({
+      conversationId: conversation._id,
+      senderId: userId,
+      content: `joined the group`,
+      messageType: 'system'
+    });
+    
+    await joinMessage.save();
+    
+    // Emit join event via Redis
+    try {
+      await initRedis();
+      const eventData = {
+        type: 'user_joined',
+        conversationId: conversation._id,
+        userId,
+        timestamp: new Date().toISOString()
+      };
+      await redisClient.publish('chat.group.message', JSON.stringify(eventData));
+    } catch (redisError) {
+      console.warn('Redis publish failed for group join:', redisError);
+    }
+    
+    res.status(200).json({ 
+      message: 'Successfully joined group',
+      conversation: {
+        id: conversation._id,
+        name: conversation.name,
+        type: conversation.type,
+        avatar: conversation.avatar,
+        participants: conversation.participants.length,
+        lastMessage: joinMessage.content,
+        lastTime: joinMessage.createdAt
+      }
+    });
+    
+  } catch (error) {
+    console.error('Error joining group:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Get group info by invite code (for preview)
+ * GET /groups/preview/:code
+ */
+const previewGroupByCode = async (req, res) => {
+  try {
+    const { code } = req.params;
+    
+    const conversation = await Conversation.findOne({ 
+      inviteCode: code,
+      type: 'group',
+      allowInvites: true
+    }).select('name description avatar participants createdAt');
+    
+    if (!conversation) {
+      return res.status(404).json({ error: 'Invalid invite code or group not found' });
+    }
+    
+    res.status(200).json({
+      group: {
+        id: conversation._id,
+        name: conversation.name,
+        description: conversation.description,
+        avatar: conversation.avatar,
+        memberCount: conversation.activeParticipants.length,
+        createdAt: conversation.createdAt
+      }
+    });
+    
+  } catch (error) {
+    console.error('Error previewing group:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Generate QR code for group invite
+ * GET /groups/:groupId/qr
+ */
+const generateGroupQR = async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const userId = req.userId;
+    
+    const conversation = await Conversation.findById(groupId);
+    if (!conversation || conversation.type !== 'group') {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+    
+    // Check if user is a participant
+    if (!conversation.hasParticipant(userId)) {
+      return res.status(403).json({ error: 'Not authorized' });
+    }
+    
+    if (!conversation.inviteCode) {
+      return res.status(400).json({ error: 'Group has no invite code' });
+    }
+    
+    const QRCode = require('qrcode');
+    const inviteLink = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/join/${conversation.inviteCode}`;
+    
+    const qrDataURL = await QRCode.toDataURL(inviteLink);
+    
+    res.status(200).json({
+      qrCode: qrDataURL,
+      inviteCode: conversation.inviteCode,
+      inviteLink
+    });
+    
+  } catch (error) {
+    console.error('Error generating QR code:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Regenerate group invite code
+ * POST /groups/:groupId/regenerate-code
+ */
+const regenerateInviteCode = async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const userId = req.userId;
+    
+    const conversation = await Conversation.findById(groupId);
+    if (!conversation || conversation.type !== 'group') {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+    
+    // Check if user is admin or owner
+    const participant = conversation.participants.find(
+      p => p.userId.toString() === userId.toString() && !p.leftAt
+    );
+    
+    if (!participant || !['admin', 'owner'].includes(participant.role)) {
+      return res.status(403).json({ error: 'Only group admins can regenerate invite codes' });
+    }
+    
+    // Generate new invite code
+    const { nanoid } = require('nanoid');
+    conversation.inviteCode = 'KG' + nanoid(8);
+    await conversation.save();
+    
+    res.status(200).json({
+      message: 'Invite code regenerated',
+      inviteCode: conversation.inviteCode
+    });
+    
+  } catch (error) {
+    console.error('Error regenerating invite code:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
 module.exports = {
   sendMessage,
   getMessages,
   getConversations,
   createDirectConversation,
   createGroupConversation,
-  updateMessageStatus
+  updateMessageStatus,
+  joinGroupByCode,
+  previewGroupByCode,
+  generateGroupQR,
+  regenerateInviteCode,
+  setRedisClient
 };

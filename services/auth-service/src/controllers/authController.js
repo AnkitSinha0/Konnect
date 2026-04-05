@@ -31,10 +31,10 @@ const REFRESH_COOKIE_OPTIONS = {
 
 const register = async (req, res, next) => {
   try {
-    const { name, email, password } = req.body;
+    const { name, email, password, username } = req.body;
 
-    if (!name || !email || !password) {
-      return res.status(400).json({ message: 'Name, email, and password are required.' });
+    if (!name || !email || !password || !username) {
+      return res.status(400).json({ message: 'Name, email, password, and username are required.' });
     }
 
     if (!EMAIL_REGEX.test(email)) {
@@ -45,20 +45,35 @@ const register = async (req, res, next) => {
       return res.status(400).json({ message: 'Password must be at least 8 characters.' });
     }
 
-    const hashedPassword = await bcrypt.hash(password, 12);
-    const existing = await User.findOne({ email });
+    if (username.length < 3) {
+      return res.status(400).json({ message: 'Username must be at least 3 characters.' });
+    }
 
-    if (existing && existing.isVerified) {
+    const hashedPassword = await bcrypt.hash(password, 12);
+    const existingEmail = await User.findOne({ email });
+    const existingUsername = await User.findOne({ username });
+
+    if (existingEmail && existingEmail.isVerified) {
       return res.status(409).json({ message: 'Email is already registered.' });
     }
 
-    if (existing && !existing.isVerified) {
+    if (existingUsername && existingUsername.isVerified) {
+      return res.status(409).json({ message: 'Username is already taken.' });
+    }
+
+    if (existingEmail && !existingEmail.isVerified) {
       // Allow re-registration of unverified accounts
-      existing.name = name;
-      existing.password = hashedPassword;
-      await existing.save();
+      existingEmail.name = name;
+      existingEmail.username = username;
+      existingEmail.password = hashedPassword;
+      // Ensure userCode exists
+      if (!existingEmail.userCode) {
+        existingEmail.userCode = 'KC' + Date.now().toString().slice(-6);
+      }
+      await existingEmail.save();
     } else {
-      await User.create({ name, email, password: hashedPassword });
+      const userCode = 'KC' + Date.now().toString().slice(-6);
+      await User.create({ name, email, username, password: hashedPassword, userCode });
     }
 
     const otp = generateOTP();
@@ -298,10 +313,35 @@ const oauthCallback = async (req, res, next) => {
       let user = await User.findOne({ email: userData.email });
       
       if (!user) {
+        // Generate unique username for OAuth user
+        const generateUsername = async (baseName) => {
+          // Clean base name - remove spaces, special chars, keep only alphanumeric and underscore
+          let cleanName = baseName.toLowerCase().replace(/[^a-zA-Z0-9_]/g, '').substring(0, 20);
+          if (cleanName.length < 3) {
+            cleanName = `user_${Math.random().toString(36).substring(2, 8)}`;
+          }
+          
+          // Check if username exists and add suffix if needed
+          let username = cleanName;
+          let counter = 1;
+          
+          while (await User.findOne({ username })) {
+            username = `${cleanName}${counter}`;
+            counter++;
+          }
+          
+          return username;
+        };
+        
+        const generatedUsername = await generateUsername(userData.name || userData.displayName);
+        
         // Create new user with OAuth provider data
+        const userCode = 'KC' + Date.now().toString().slice(-6);
         user = await User.create({
           name: userData.name || userData.displayName,
+          username: generatedUsername,
           email: userData.email,
+          userCode,
           isVerified: true, // OAuth users are pre-verified by the provider
           oauthProviders: [{
             provider: userData.provider,
@@ -371,6 +411,93 @@ const oauthCallback = async (req, res, next) => {
   }
 };
 
+// ─── GET /auth/users/search ──────────────────────────────────────────────────
+
+const searchUsers = async (req, res, next) => {
+  try {
+    const { q, type = 'all' } = req.query;
+    
+    if (!q || q.trim().length < 2) {
+      return res.status(400).json({ message: 'Search query must be at least 2 characters.' });
+    }
+
+    const query = q.trim();
+    let searchFilter = {};
+    
+    // Build search filter based on type
+    switch (type) {
+      case 'username':
+        searchFilter = { username: { $regex: query, $options: 'i' } };
+        break;
+      case 'email':
+        searchFilter = { email: { $regex: query, $options: 'i' } };
+        break;
+      case 'usercode':
+        searchFilter = { userCode: { $regex: query, $options: 'i' } };
+        break;
+      default:
+        // Search across username, email, and name
+        searchFilter = {
+          $or: [
+            { username: { $regex: query, $options: 'i' } },
+            { email: { $regex: query, $options: 'i' } },
+            { name: { $regex: query, $options: 'i' } },
+            { userCode: { $regex: query, $options: 'i' } }
+          ]
+        };
+    }
+
+    // Only search verified users
+    searchFilter.isVerified = true;
+
+    const users = await User.find(searchFilter)
+      .select('name username email userCode _id')
+      .limit(20)
+      .lean();
+
+    return res.status(200).json({ users });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// ─── GET /auth/users/me ──────────────────────────────────────────────────────
+
+const getCurrentUser = async (req, res, next) => {
+  try {
+    const userId = req.userId; // From JWT middleware
+    console.log('getCurrentUser called for userId:', userId, typeof userId);
+    
+    if (!userId) {
+      console.error('No userId provided by auth middleware');
+      return res.status(400).json({ message: 'Invalid user session' });
+    }
+    
+    const user = await User.findById(userId)
+      .select('name username email userCode _id isVerified')
+      .lean();
+    
+    console.log('User found:', user ? 'yes' : 'no', user ? user.username : 'N/A');
+    
+    if (!user) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    // Ensure userCode exists for existing users
+    if (!user.userCode) {
+      console.log('User missing userCode, generating one:', user.username);
+      const generatedCode = 'KC' + Date.now().toString().slice(-6);
+      await User.findByIdAndUpdate(userId, { userCode: generatedCode });
+      user.userCode = generatedCode;
+    }
+
+    return res.status(200).json({ user });
+  } catch (err) {
+    console.error('getCurrentUser error:', err);
+    next(err);
+  }
+};
+
 module.exports = { 
   register, 
   login, 
@@ -379,5 +506,8 @@ module.exports = {
   logout,
   // OAuth methods
   oauthLogin,
-  oauthCallback
+  oauthCallback,
+  // User search
+  searchUsers,
+  getCurrentUser
 };

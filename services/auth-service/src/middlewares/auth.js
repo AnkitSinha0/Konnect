@@ -6,33 +6,32 @@ const authenticateToken = (req, res, next) => {
     const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
     
     if (!token) {
-      return res.status(401).json({ error: 'Access token required' });
+      return res.status(401).json({ message: 'Access token required' });
     }
     
     jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
       if (err) {
         console.error('JWT verification error:', err.message);
-        return res.status(403).json({ error: 'Invalid or expired token' });
+        return res.status(403).json({ message: 'Invalid or expired token' });
       }
       
-      console.log('Chat service JWT decoded payload:', decoded);
+      console.log('JWT decoded payload:', decoded);
       
       // Handle both old and new token formats for backward compatibility
       req.userId = decoded.userId || decoded.id;
       req.userEmail = decoded.email;
-      req.userName = decoded.name || decoded.email;
       
       if (!req.userId) {
-        console.error('No user ID found in chat service token payload:', decoded);
-        return res.status(403).json({ error: 'Invalid token payload' });
+        console.error('No user ID found in token payload:', decoded);
+        return res.status(403).json({ message: 'Invalid token payload' });
       }
       
-      console.log('Chat service auth successful for user:', req.userId);
+      console.log('Auth middleware setting userId:', req.userId);
       next();
     });
   } catch (error) {
     console.error('Auth middleware error:', error);
-    res.status(500).json({ error: 'Internal server error' });
+    res.status(500).json({ message: 'Internal server error' });
   }
 };
 

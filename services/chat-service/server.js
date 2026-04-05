@@ -5,6 +5,12 @@ const redis = require('redis');
 const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const chatRoutes = require('./src/routes/chatRoutes');
+const { setRedisClient } = require('./src/controllers/chatController');
+
+// Register models (must be done before any route handlers)
+require('./src/models/User');
+require('./src/models/Message');
+require('./src/models/Conversation');
 
 const app = express();
 const PORT = process.env.PORT || 3003;
@@ -12,10 +18,14 @@ const PORT = process.env.PORT || 3003;
 // Redis client for pub/sub
 let redisClient;
 
-// CORS configuration
+// CORS configuration  
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:3000',
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  preflightContinue: false,
+  optionsSuccessStatus: 200
 }));
 
 app.use(express.json());
@@ -50,8 +60,21 @@ const start = async () => {
     await mongoose.connect(process.env.MONGO_URI);
     console.log('✅ Chat Service: MongoDB connected');
     
-    // For now, skip Redis connection for testing
-    console.log('⚠️  Chat Service: Running without Redis (pub/sub disabled)');
+    // Enable Redis connection for pub/sub
+    try {
+      redisClient = redis.createClient({ url: process.env.REDIS_URL });
+      redisClient.on('error', (err) => console.error('❌ Redis Client Error:', err));
+      redisClient.on('ready', () => console.log('✅ Chat Service: Redis connected'));
+      
+      await redisClient.connect();
+      console.log('✅ Chat Service: Redis pub/sub enabled');
+      
+      // Pass Redis client to controller
+      setRedisClient(redisClient);
+      
+    } catch (redisError) {
+      console.error('⚠️  Chat Service: Redis connection failed, continuing without pub/sub:', redisError.message);
+    }
     
     app.listen(PORT, () => {
       console.log(`🚀 Chat Service running on port ${PORT}`);

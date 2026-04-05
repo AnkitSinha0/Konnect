@@ -13,8 +13,6 @@ http:
       service: "chat-service"
       entryPoints:
         - "web"
-      middlewares:
-        - "api-strip-prefix"
     
     websocket-gateway-router:
       rule: "PathPrefix(`/ws`)"
@@ -22,9 +20,15 @@ http:
       entryPoints:
         - "web"
       middlewares:
-        - "ws-strip-prefix"
+        - "ws-headers"
   
   middlewares:
+    ws-headers:
+      headers:
+        customRequestHeaders:
+          X-Forwarded-Proto: "http"
+        # Ensure WebSocket upgrade headers pass through
+        # Traefik v3 handles WebSocket natively when not stripped
     auth-strip-prefix:
       stripPrefix:
         prefixes:
