@@ -34,6 +34,22 @@ const sendMessage = async (req, res) => {
     if (!conversation.hasParticipant(senderId)) {
       return res.status(403).json({ error: 'Not authorized to send messages in this conversation' });
     }
+
+    // Enforce mute: check if sender is currently muted
+    if (conversation.type === 'group') {
+      const senderParticipant = conversation.participants.find(
+        p => p.userId.toString() === senderId.toString() && !p.leftAt
+      );
+      if (senderParticipant?.isMuted) {
+        if (!senderParticipant.mutedUntil || senderParticipant.mutedUntil > new Date()) {
+          return res.status(403).json({ error: 'You are muted in this group' });
+        }
+        // Mute has expired — clear it
+        senderParticipant.isMuted = false;
+        senderParticipant.mutedUntil = null;
+        await conversation.save();
+      }
+    }
     
     // Create message
     let expiresAt = null;
@@ -150,28 +166,33 @@ const getMessages = async (req, res) => {
     }
     
     const skip = (page - 1) * limit;
-    
-    const messages = await Message.find({
+
+    // For group chats, only show messages after the user's joinedAt timestamp
+    const messageQuery = {
       conversationId,
       deletedAt: null,
       $or: [
         { expiresAt: null },
         { expiresAt: { $gt: new Date() } }
       ]
-    })
+    };
+
+    if (conversation.type === 'group') {
+      const participant = conversation.participants.find(
+        p => p.userId.toString() === userId.toString() && !p.leftAt && !p.isBanned
+      );
+      if (participant && participant.joinedAt) {
+        messageQuery.createdAt = { $gte: participant.joinedAt };
+      }
+    }
+    
+    const messages = await Message.find(messageQuery)
     .populate({ path: 'senderId', select: 'name email avatar', model: User })
     .sort({ createdAt: -1 })
     .skip(skip)
     .limit(parseInt(limit));
     
-    const total = await Message.countDocuments({
-      conversationId,
-      deletedAt: null,
-      $or: [
-        { expiresAt: null },
-        { expiresAt: { $gt: new Date() } }
-      ]
-    });
+    const total = await Message.countDocuments(messageQuery);
     
     res.json({
       messages: messages.reverse(), // Most recent last for chat display
@@ -199,9 +220,17 @@ const getConversations = async (req, res) => {
     const userId = req.userId;
     const skip = (page - 1) * limit;
     
+    // Include conversations where user is active OR banned (so banned users still see the group)
     const conversations = await Conversation.find({
-      'participants.userId': userId,
-      'participants.leftAt': null
+      participants: {
+        $elemMatch: {
+          userId: userId,
+          $or: [
+            { leftAt: null },
+            { isBanned: true }
+          ]
+        }
+      }
     })
     .populate({ path: 'participants.userId', select: 'name email avatar', model: User })
     .populate({ path: 'lastMessage.senderId', select: 'name email avatar', model: User })
@@ -210,8 +239,15 @@ const getConversations = async (req, res) => {
     .limit(parseInt(limit));
     
     const total = await Conversation.countDocuments({
-      'participants.userId': userId,
-      'participants.leftAt': null
+      participants: {
+        $elemMatch: {
+          userId: userId,
+          $or: [
+            { leftAt: null },
+            { isBanned: true }
+          ]
+        }
+      }
     });
     
     // Transform data for frontend
@@ -219,6 +255,8 @@ const getConversations = async (req, res) => {
       const participant = conv.participants.find(p => 
         p.userId && p.userId._id && p.userId._id.toString() === userId.toString()
       );
+      
+      const isBanned = participant?.isBanned === true;
       
       let displayInfo = {};
       
@@ -241,7 +279,10 @@ const getConversations = async (req, res) => {
         displayInfo = {
           name: conv.name || 'Group Chat',
           avatar: conv.avatar,
-          participantCount: conv.activeParticipants.length
+          participantCount: conv.activeParticipants.length,
+          participantIds: conv.activeParticipants
+            .map(p => p.userId?._id?.toString())
+            .filter(Boolean)
         };
       }
       
@@ -258,6 +299,7 @@ const getConversations = async (req, res) => {
         } : null,
         unreadCount: 0, // TODO: Implement unread count
         isPremium: conv.isPremium,
+        isBanned,
         userRole: participant?.role,
         updatedAt: conv.updatedAt
       };
@@ -435,6 +477,14 @@ const joinGroupByCode = async (req, res) => {
       return res.status(404).json({ error: 'Invalid invite code or group not found' });
     }
     
+    // Check if user is banned from this group
+    const bannedParticipant = conversation.participants.find(
+      p => p.userId.toString() === userId.toString() && p.isBanned
+    );
+    if (bannedParticipant) {
+      return res.status(403).json({ error: 'You are banned from this group' });
+    }
+
     // Check if user is already a participant
     const existingParticipant = conversation.participants.find(
       p => p.userId.toString() === userId.toString() && !p.leftAt
@@ -453,12 +503,16 @@ const joinGroupByCode = async (req, res) => {
     
     await conversation.save();
     await conversation.populate({ path: 'participants.userId', select: 'name email username', model: User });
+
+    // Get user's name for system message
+    const joiningUser = await User.findById(userId).select('name username');
+    const joinerName = joiningUser?.name || joiningUser?.username || 'Someone';
     
     // Create join message
     const joinMessage = new Message({
       conversationId: conversation._id,
       senderId: userId,
-      content: `joined the group`,
+      content: `${joinerName} joined the group`,
       messageType: 'system'
     });
     
@@ -466,12 +520,19 @@ const joinGroupByCode = async (req, res) => {
     
     // Emit join event via Redis
     try {
-      await initRedis();
+      if (!redisClient) {
+        const redis = require('redis');
+        redisClient = redis.createClient({ url: process.env.REDIS_URL });
+        redisClient.on('error', (err) => console.log('Redis Client Error', err));
+        await redisClient.connect();
+      }
       const eventData = {
-        type: 'user_joined',
+        messageId: joinMessage._id,
         conversationId: conversation._id,
-        userId,
-        timestamp: new Date().toISOString()
+        senderId: userId,
+        content: joinMessage.content,
+        messageType: 'system',
+        timestamp: joinMessage.createdAt
       };
       await redisClient.publish('chat.group.message', JSON.stringify(eventData));
     } catch (redisError) {
@@ -596,8 +657,7 @@ const regenerateInviteCode = async (req, res) => {
     }
     
     // Generate new invite code
-    const { nanoid } = require('nanoid');
-    conversation.inviteCode = 'KG' + nanoid(8);
+    conversation.inviteCode = 'KG' + require('crypto').randomBytes(6).toString('hex');
     await conversation.save();
     
     res.status(200).json({
@@ -607,6 +667,552 @@ const regenerateInviteCode = async (req, res) => {
     
   } catch (error) {
     console.error('Error regenerating invite code:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Get group members with roles
+ * GET /groups/:groupId/members
+ */
+const getGroupMembers = async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const userId = req.userId;
+
+    const conversation = await Conversation.findById(groupId);
+    if (!conversation || conversation.type !== 'group') {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    // Allow banned users to view members (they can still see the group)
+    const userParticipant = conversation.participants.find(
+      p => p.userId.toString() === userId.toString()
+    );
+    if (!userParticipant || (userParticipant.leftAt && !userParticipant.isBanned)) {
+      return res.status(403).json({ error: 'Not a member of this group' });
+    }
+
+    await conversation.populate({ path: 'participants.userId', select: 'name username email avatar', model: User });
+
+    const members = conversation.participants
+      .filter(p => !p.leftAt && !p.isBanned)
+      .map(p => ({
+        userId: p.userId._id,
+        name: p.userId.name,
+        username: p.userId.username,
+        avatar: p.userId.avatar,
+        role: p.role,
+        joinedAt: p.joinedAt,
+        isMuted: p.isMuted,
+        mutedUntil: p.mutedUntil
+      }));
+
+    // Include banned members list for admin/owner
+    const callerRole = userParticipant.role;
+    let bannedMembers = [];
+    if (['admin', 'owner'].includes(callerRole)) {
+      bannedMembers = conversation.participants
+        .filter(p => p.isBanned)
+        .map(p => ({
+          userId: p.userId._id,
+          name: p.userId.name,
+          username: p.userId.username,
+          avatar: p.userId.avatar,
+          bannedAt: p.leftAt
+        }));
+    }
+
+    res.json({ members, bannedMembers });
+  } catch (error) {
+    console.error('Error fetching group members:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Update a member's role (promote / demote)
+ * PATCH /groups/:groupId/members/:memberId/role
+ * Body: { role: 'member' | 'moderator' | 'admin' }
+ *
+ * Permission rules:
+ *  - owner can set anyone (below owner) to any role below owner
+ *  - admin can promote/demote moderators only
+ */
+const updateMemberRole = async (req, res) => {
+  try {
+    const { groupId, memberId } = req.params;
+    const { role: newRole } = req.body;
+    const actorId = req.userId;
+
+    const ALLOWED_ROLES = ['member', 'moderator', 'admin'];
+    if (!ALLOWED_ROLES.includes(newRole)) {
+      return res.status(400).json({ error: 'Invalid role. Allowed: member, moderator, admin' });
+    }
+
+    const conversation = await Conversation.findById(groupId);
+    if (!conversation || conversation.type !== 'group') {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    const actorRole = conversation.getUserRole(actorId);
+    if (!actorRole) return res.status(403).json({ error: 'Not a member of this group' });
+
+    const targetParticipant = conversation.participants.find(
+      p => p.userId.toString() === memberId && !p.leftAt && !p.isBanned
+    );
+    if (!targetParticipant) return res.status(404).json({ error: 'Member not found' });
+
+    const targetRole = targetParticipant.role;
+    const RANK = Conversation.ROLE_RANK;
+
+    // Cannot change the owner's role
+    if (targetRole === 'owner') {
+      return res.status(403).json({ error: 'Cannot change the owner\'s role' });
+    }
+
+    // Actor must outrank the target's current role AND the new role
+    if (RANK[actorRole] <= RANK[targetRole] || RANK[actorRole] <= RANK[newRole]) {
+      return res.status(403).json({ error: 'Insufficient permissions to assign this role' });
+    }
+
+    targetParticipant.role = newRole;
+    await conversation.save();
+
+    res.json({ message: `Role updated to ${newRole}`, userId: memberId, role: newRole });
+  } catch (error) {
+    console.error('Error updating member role:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Remove (kick) a member from the group
+ * DELETE /groups/:groupId/members/:memberId
+ * Admins can remove members/moderators; owner can remove anyone
+ */
+const removeMember = async (req, res) => {
+  try {
+    const { groupId, memberId } = req.params;
+    const actorId = req.userId;
+
+    const conversation = await Conversation.findById(groupId);
+    if (!conversation || conversation.type !== 'group') {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    const actorRole = conversation.getUserRole(actorId);
+    if (!actorRole) return res.status(403).json({ error: 'Not a member of this group' });
+
+    const targetParticipant = conversation.participants.find(
+      p => p.userId.toString() === memberId && !p.leftAt && !p.isBanned
+    );
+    if (!targetParticipant) return res.status(404).json({ error: 'Member not found' });
+
+    const targetRole = targetParticipant.role;
+    if (!Conversation.canManage(actorRole, targetRole)) {
+      return res.status(403).json({ error: 'Insufficient permissions to remove this member' });
+    }
+
+    targetParticipant.leftAt = new Date();
+    await conversation.save();
+
+    // Get target user's name for system message
+    const targetUser = await User.findById(memberId).select('name username');
+    const targetName = targetUser?.name || targetUser?.username || 'A member';
+
+    // Create system message
+    const systemMessage = new Message({
+      conversationId: groupId,
+      senderId: actorId,
+      content: `${targetName} was removed from the group`,
+      messageType: 'system'
+    });
+    await systemMessage.save();
+
+    // Publish removal event via Redis
+    try {
+      if (!redisClient) {
+        const redis = require('redis');
+        redisClient = redis.createClient({ url: process.env.REDIS_URL });
+        redisClient.on('error', (err) => console.log('Redis Client Error', err));
+        await redisClient.connect();
+      }
+      // Notify the removed user
+      await redisClient.publish('chat.member.removed', JSON.stringify({
+        userId: memberId,
+        conversationId: groupId
+      }));
+      // Broadcast system message to remaining members
+      await redisClient.publish('chat.group.message', JSON.stringify({
+        messageId: systemMessage._id,
+        conversationId: groupId,
+        senderId: actorId,
+        content: systemMessage.content,
+        messageType: 'system',
+        timestamp: systemMessage.createdAt
+      }));
+    } catch (redisError) {
+      console.error('Redis publish failed for remove event:', redisError.message);
+    }
+
+    res.json({ message: 'Member removed from group' });
+  } catch (error) {
+    console.error('Error removing member:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Mute a member temporarily
+ * PATCH /groups/:groupId/members/:memberId/mute
+ * Body: { durationMinutes: number } — 0 to unmute
+ * Admin and moderator can mute members; admin can mute moderators
+ */
+const muteMember = async (req, res) => {
+  try {
+    const { groupId, memberId } = req.params;
+    const { durationMinutes = 10 } = req.body;
+    const actorId = req.userId;
+
+    const conversation = await Conversation.findById(groupId);
+    if (!conversation || conversation.type !== 'group') {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    const actorRole = conversation.getUserRole(actorId);
+    if (!['moderator', 'admin', 'owner'].includes(actorRole)) {
+      return res.status(403).json({ error: 'Only moderators and above can mute members' });
+    }
+
+    const targetParticipant = conversation.participants.find(
+      p => p.userId.toString() === memberId && !p.leftAt && !p.isBanned
+    );
+    if (!targetParticipant) return res.status(404).json({ error: 'Member not found' });
+
+    if (!Conversation.canManage(actorRole, targetParticipant.role)) {
+      return res.status(403).json({ error: 'Insufficient permissions to mute this member' });
+    }
+
+    if (durationMinutes <= 0) {
+      targetParticipant.isMuted = false;
+      targetParticipant.mutedUntil = null;
+    } else {
+      targetParticipant.isMuted = true;
+      targetParticipant.mutedUntil = new Date(Date.now() + durationMinutes * 60 * 1000);
+    }
+
+    await conversation.save();
+
+    // Notify gateway to update in-memory mute state
+    try {
+      if (!redisClient) {
+        const redis = require('redis');
+        redisClient = redis.createClient({ url: process.env.REDIS_URL });
+        redisClient.on('error', (err) => console.log('Redis Client Error', err));
+        await redisClient.connect();
+      }
+      if (durationMinutes <= 0) {
+        await redisClient.publish('chat.member.unmuted', JSON.stringify({ userId: memberId, conversationId: groupId }));
+      } else {
+        await redisClient.publish('chat.member.muted', JSON.stringify({
+          userId: memberId,
+          conversationId: groupId,
+          mutedUntil: targetParticipant.mutedUntil,
+          durationMinutes
+        }));
+      }
+    } catch (redisError) {
+      console.error('Redis publish failed for mute event:', redisError.message);
+    }
+
+    const action = durationMinutes <= 0 ? 'unmuted' : `muted for ${durationMinutes} minutes`;
+    res.json({ message: `Member ${action}`, isMuted: targetParticipant.isMuted, mutedUntil: targetParticipant.mutedUntil });
+  } catch (error) {
+    console.error('Error muting member:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Ban a member from the group
+ * PATCH /groups/:groupId/members/:memberId/ban
+ * Admin+ can ban members/moderators
+ */
+const banMember = async (req, res) => {
+  try {
+    const { groupId, memberId } = req.params;
+    const actorId = req.userId;
+
+    const conversation = await Conversation.findById(groupId);
+    if (!conversation || conversation.type !== 'group') {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    const actorRole = conversation.getUserRole(actorId);
+    if (!['admin', 'owner'].includes(actorRole)) {
+      return res.status(403).json({ error: 'Only admins and owners can ban members' });
+    }
+
+    const targetParticipant = conversation.participants.find(
+      p => p.userId.toString() === memberId && !p.leftAt
+    );
+    if (!targetParticipant) return res.status(404).json({ error: 'Member not found' });
+
+    if (!Conversation.canManage(actorRole, targetParticipant.role)) {
+      return res.status(403).json({ error: 'Insufficient permissions to ban this member' });
+    }
+
+    targetParticipant.isBanned = true;
+    targetParticipant.leftAt = new Date();
+    await conversation.save();
+
+    // Get target user's name for system message
+    const targetUser = await User.findById(memberId).select('name username');
+    const targetName = targetUser?.name || targetUser?.username || 'A member';
+
+    // Create system message
+    const systemMessage = new Message({
+      conversationId: groupId,
+      senderId: actorId,
+      content: `${targetName} was banned from the group`,
+      messageType: 'system'
+    });
+    await systemMessage.save();
+
+    // Notify gateway to kick the banned user from the conversation room
+    try {
+      if (!redisClient) {
+        const redis = require('redis');
+        redisClient = redis.createClient({ url: process.env.REDIS_URL });
+        redisClient.on('error', (err) => console.log('Redis Client Error', err));
+        await redisClient.connect();
+      }
+      await redisClient.publish('chat.member.banned', JSON.stringify({ userId: memberId, conversationId: groupId }));
+      // Broadcast system message to remaining members
+      await redisClient.publish('chat.group.message', JSON.stringify({
+        messageId: systemMessage._id,
+        conversationId: groupId,
+        senderId: actorId,
+        content: systemMessage.content,
+        messageType: 'system',
+        timestamp: systemMessage.createdAt
+      }));
+    } catch (redisError) {
+      console.error('Redis publish failed for ban event:', redisError.message);
+    }
+
+    res.json({ message: 'Member banned from group' });
+  } catch (error) {
+    console.error('Error banning member:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Unban a member from the group
+ * PATCH /groups/:groupId/members/:memberId/unban
+ * Admin+ can unban
+ */
+const unbanMember = async (req, res) => {
+  try {
+    const { groupId, memberId } = req.params;
+    const actorId = req.userId;
+
+    const conversation = await Conversation.findById(groupId);
+    if (!conversation || conversation.type !== 'group') {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    const actorRole = conversation.getUserRole(actorId);
+    if (!['admin', 'owner'].includes(actorRole)) {
+      return res.status(403).json({ error: 'Only admins and owners can unban members' });
+    }
+
+    const targetParticipant = conversation.participants.find(
+      p => p.userId.toString() === memberId && p.isBanned
+    );
+    if (!targetParticipant) return res.status(404).json({ error: 'Banned member not found' });
+
+    targetParticipant.isBanned = false;
+    targetParticipant.leftAt = null;
+    targetParticipant.joinedAt = new Date();
+    targetParticipant.role = 'member';
+    await conversation.save();
+
+    // Get target user's name for system message
+    const targetUser = await User.findById(memberId).select('name username');
+    const targetName = targetUser?.name || targetUser?.username || 'A member';
+
+    const systemMessage = new Message({
+      conversationId: groupId,
+      senderId: actorId,
+      content: `${targetName} was unbanned`,
+      messageType: 'system'
+    });
+    await systemMessage.save();
+
+    try {
+      if (!redisClient) {
+        const redis = require('redis');
+        redisClient = redis.createClient({ url: process.env.REDIS_URL });
+        redisClient.on('error', (err) => console.log('Redis Client Error', err));
+        await redisClient.connect();
+      }
+      await redisClient.publish('chat.group.message', JSON.stringify({
+        messageId: systemMessage._id,
+        conversationId: groupId,
+        senderId: actorId,
+        content: systemMessage.content,
+        messageType: 'system',
+        timestamp: systemMessage.createdAt
+      }));
+    } catch (redisError) {
+      console.error('Redis publish failed for unban event:', redisError.message);
+    }
+
+    res.json({ message: 'Member unbanned' });
+  } catch (error) {
+    console.error('Error unbanning member:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Leave a group (self-remove)
+ * POST /groups/:groupId/leave
+ */
+const leaveGroup = async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const userId = req.userId;
+
+    const conversation = await Conversation.findById(groupId);
+    if (!conversation || conversation.type !== 'group') {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    const participant = conversation.participants.find(
+      p => p.userId.toString() === userId.toString() && !p.leftAt && !p.isBanned
+    );
+    if (!participant) return res.status(404).json({ error: 'You are not a member of this group' });
+
+    if (participant.role === 'owner') {
+      // If owner is leaving, check if there are other members to transfer ownership
+      const otherMembers = conversation.participants.filter(
+        p => p.userId.toString() !== userId.toString() && !p.leftAt && !p.isBanned
+      );
+      if (otherMembers.length > 0) {
+        // Transfer ownership to highest-ranked remaining member
+        const ranked = otherMembers.sort(
+          (a, b) => (Conversation.ROLE_RANK[b.role] || 0) - (Conversation.ROLE_RANK[a.role] || 0)
+        );
+        ranked[0].role = 'owner';
+      }
+    }
+
+    participant.leftAt = new Date();
+    await conversation.save();
+
+    // Get user name for system message
+    const leavingUser = await User.findById(userId).select('name username');
+    const leavingName = leavingUser?.name || leavingUser?.username || 'A member';
+
+    const systemMessage = new Message({
+      conversationId: groupId,
+      senderId: userId,
+      content: `${leavingName} left the group`,
+      messageType: 'system'
+    });
+    await systemMessage.save();
+
+    try {
+      if (!redisClient) {
+        const redis = require('redis');
+        redisClient = redis.createClient({ url: process.env.REDIS_URL });
+        redisClient.on('error', (err) => console.log('Redis Client Error', err));
+        await redisClient.connect();
+      }
+      await redisClient.publish('chat.group.message', JSON.stringify({
+        messageId: systemMessage._id,
+        conversationId: groupId,
+        senderId: userId,
+        content: systemMessage.content,
+        messageType: 'system',
+        timestamp: systemMessage.createdAt
+      }));
+    } catch (redisError) {
+      console.error('Redis publish failed for leave event:', redisError.message);
+    }
+
+    res.json({ message: 'You have left the group' });
+  } catch (error) {
+    console.error('Error leaving group:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Delete a message (admin / moderator)
+ * DELETE /messages/:messageId
+ */
+const deleteMessage = async (req, res) => {
+  try {
+    const { messageId } = req.params;
+    const userId = req.userId;
+
+    const message = await Message.findById(messageId);
+    if (!message || message.deletedAt) {
+      return res.status(404).json({ error: 'Message not found' });
+    }
+
+    const conversation = await Conversation.findById(message.conversationId);
+    if (!conversation) return res.status(404).json({ error: 'Conversation not found' });
+
+    const userRole = conversation.getUserRole(userId);
+    const isOwnMessage = message.senderId.toString() === userId.toString();
+
+    // Own messages can always be deleted; others require moderator+
+    if (!isOwnMessage && !['moderator', 'admin', 'owner'].includes(userRole)) {
+      return res.status(403).json({ error: 'Insufficient permissions to delete this message' });
+    }
+
+    message.deletedAt = new Date();
+    message.content = 'This message was deleted.';
+    await message.save();
+
+    res.json({ message: 'Message deleted' });
+  } catch (error) {
+    console.error('Error deleting message:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Delete the entire group (owner only)
+ * DELETE /groups/:groupId
+ */
+const deleteGroup = async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const userId = req.userId;
+
+    const conversation = await Conversation.findById(groupId);
+    if (!conversation || conversation.type !== 'group') {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    const userRole = conversation.getUserRole(userId);
+    if (userRole !== 'owner') {
+      return res.status(403).json({ error: 'Only the group owner can delete the group' });
+    }
+
+    await Message.deleteMany({ conversationId: groupId });
+    await Conversation.findByIdAndDelete(groupId);
+
+    res.json({ message: 'Group deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting group:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 };
@@ -622,5 +1228,14 @@ module.exports = {
   previewGroupByCode,
   generateGroupQR,
   regenerateInviteCode,
+  getGroupMembers,
+  updateMemberRole,
+  removeMember,
+  muteMember,
+  banMember,
+  unbanMember,
+  leaveGroup,
+  deleteMessage,
+  deleteGroup,
   setRedisClient
 };

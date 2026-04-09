@@ -28,6 +28,10 @@ let presenceClient, pubClient, subClient;
 const connectedUsers = new Map(); // Local users on this server instance
 const userSockets = new Map(); // socketId -> userId mapping for this server
 
+// Track banned/muted members: Set of "userId:conversationId" strings
+const bannedInConv = new Set();
+const mutedInConv = new Map(); // "userId:conversationId" -> mutedUntil (Date)
+
 // Health check endpoint
 app.get('/health', async (req, res) => {
   try {
@@ -232,6 +236,29 @@ io.on('connection', async (socket) => {
         conversationId
       });
     });
+
+    // Check which group members are online
+    socket.on('group:getOnlineMembers', async ({ memberIds }) => {
+      if (!memberIds || !Array.isArray(memberIds)) return;
+      try {
+        const onlineIds = [];
+        if (presenceClient && presenceClient.isReady) {
+          for (const id of memberIds) {
+            const isOnline = await presenceClient.get(`online:${id}`);
+            if (isOnline) onlineIds.push(id);
+          }
+        } else {
+          // Fallback to local map
+          for (const id of memberIds) {
+            if (connectedUsers.has(id)) onlineIds.push(id);
+          }
+        }
+        socket.emit('group:onlineMembers', { onlineIds });
+      } catch (err) {
+        console.error('Error checking group online members:', err);
+        socket.emit('group:onlineMembers', { onlineIds: [] });
+      }
+    });
     
     // Handle typing indicators (accept string or object)
     socket.on('typing:start', (data) => {
@@ -239,6 +266,16 @@ io.on('connection', async (socket) => {
       const targetUserId = typeof data === 'object' ? data?.targetUserId : null;
       console.log(`⌨️  typing:start from ${userId} conv=${conversationId} target=${targetUserId}`);
       if (!conversationId) return;
+
+      // Block banned or currently muted users from emitting typing
+      const memberKey = `${userId}:${conversationId}`;
+      if (bannedInConv.has(memberKey)) return;
+      const mutedUntil = mutedInConv.get(memberKey);
+      if (mutedUntil !== undefined) {
+        if (mutedUntil === null || mutedUntil > new Date()) return;
+        mutedInConv.delete(memberKey); // mute expired
+      }
+
       const payload = { userId, userName: socket.userName, conversationId, isTyping: true };
       if (targetUserId) {
         // Direct 1:1: emit to target's personal room — no room join required
@@ -253,6 +290,10 @@ io.on('connection', async (socket) => {
       const conversationId = typeof data === 'string' ? data : data?.conversationId;
       const targetUserId = typeof data === 'object' ? data?.targetUserId : null;
       if (!conversationId) return;
+
+      // Block banned users from emitting typing:stop as well
+      if (bannedInConv.has(`${userId}:${conversationId}`)) return;
+
       const payload = { userId, userName: socket.userName, conversationId, isTyping: false };
       if (targetUserId) {
         io.to(`user:${targetUserId}`).emit('user:typing', payload);
@@ -493,11 +534,15 @@ const handleIncomingMessage = async (channel, message) => {
         // Handle group chat message
         console.log(`📨 Group message in conversation ${data.conversationId}`);
         
-        // Send to all participants in the conversation on THIS server
-        io.to(`conversation:${data.conversationId}`).emit('message:new', data);
+        // Send to all participants EXCEPT the sender (sender already has the optimistic temp message)
+        const groupSenderSocketId = connectedUsers.get(data.senderId.toString());
+        if (groupSenderSocketId) {
+          io.to(`conversation:${data.conversationId}`).except(groupSenderSocketId).emit('message:new', data);
+        } else {
+          io.to(`conversation:${data.conversationId}`).emit('message:new', data);
+        }
         
         // Notify sender (if on this server)
-        const groupSenderSocketId = connectedUsers.get(data.senderId.toString());
         if (groupSenderSocketId) {
           io.to(`user:${data.senderId}`).emit('message:sent', {
             messageId: data.messageId,
@@ -509,6 +554,70 @@ const handleIncomingMessage = async (channel, message) => {
         console.log(`✅ Group message delivered to conversation ${data.conversationId} on this server`);
         break;
         
+      case 'chat.member.banned': {
+        const key = `${data.userId}:${data.conversationId}`;
+        bannedInConv.add(key);
+        // Kick the banned user out of the conversation socket room
+        const bannedSocketId = connectedUsers.get(data.userId.toString());
+        if (bannedSocketId) {
+          const bannedSocket = io.sockets.sockets.get(bannedSocketId);
+          if (bannedSocket) {
+            bannedSocket.leave(`conversation:${data.conversationId}`);
+            bannedSocket.emit('member:banned', { conversationId: data.conversationId });
+          }
+        }
+        console.log(`🚫 User ${data.userId} banned from conversation ${data.conversationId}`);
+        break;
+      }
+
+      case 'chat.member.removed': {
+        // Kick the removed user out of the conversation socket room
+        const removedSocketId = connectedUsers.get(data.userId.toString());
+        if (removedSocketId) {
+          const removedSocket = io.sockets.sockets.get(removedSocketId);
+          if (removedSocket) {
+            removedSocket.leave(`conversation:${data.conversationId}`);
+            removedSocket.emit('member:removed', { conversationId: data.conversationId });
+          }
+        }
+        console.log(`👢 User ${data.userId} removed from conversation ${data.conversationId}`);
+        break;
+      }
+
+      case 'chat.member.muted': {
+        const muteKey = `${data.userId}:${data.conversationId}`;
+        mutedInConv.set(muteKey, data.mutedUntil ? new Date(data.mutedUntil) : null);
+        // Emit mute event to the target user so their UI can show the countdown
+        const mutedSocketId = connectedUsers.get(data.userId.toString());
+        if (mutedSocketId) {
+          const mutedSocket = io.sockets.sockets.get(mutedSocketId);
+          if (mutedSocket) {
+            mutedSocket.emit('member:muted', {
+              conversationId: data.conversationId,
+              mutedUntil: data.mutedUntil,
+              durationMinutes: data.durationMinutes
+            });
+          }
+        }
+        console.log(`🔇 User ${data.userId} muted in conversation ${data.conversationId} until ${data.mutedUntil}`);
+        break;
+      }
+
+      case 'chat.member.unmuted': {
+        const unmuteKey = `${data.userId}:${data.conversationId}`;
+        mutedInConv.delete(unmuteKey);
+        // Emit unmute event to the target user
+        const unmutedSocketId = connectedUsers.get(data.userId.toString());
+        if (unmutedSocketId) {
+          const unmutedSocket = io.sockets.sockets.get(unmutedSocketId);
+          if (unmutedSocket) {
+            unmutedSocket.emit('member:unmuted', { conversationId: data.conversationId });
+          }
+        }
+        console.log(`🔊 User ${data.userId} unmuted in conversation ${data.conversationId}`);
+        break;
+      }
+
       default:
         console.log(`❓ Unknown channel: ${channel}`);
     }
@@ -662,7 +771,11 @@ const start = async () => {
           const channels = [
             process.env.REDIS_CHAT_CHANNEL || 'chat.message',
             process.env.REDIS_GROUP_CHANNEL || 'chat.group.message',
-            'user.presence'
+            'user.presence',
+            'chat.member.banned',
+            'chat.member.removed',
+            'chat.member.muted',
+            'chat.member.unmuted'
           ];
 
           for (const ch of channels) {

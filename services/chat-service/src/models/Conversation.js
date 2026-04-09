@@ -1,4 +1,5 @@
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 
 const conversationSchema = new mongoose.Schema({
   type: {
@@ -18,8 +19,20 @@ const conversationSchema = new mongoose.Schema({
     },
     role: {
       type: String,
-      enum: ['member', 'admin', 'owner'],
+      enum: ['member', 'moderator', 'admin', 'owner'],
       default: 'member'
+    },
+    isMuted: {
+      type: Boolean,
+      default: false
+    },
+    mutedUntil: {
+      type: Date,
+      default: null
+    },
+    isBanned: {
+      type: Boolean,
+      default: false
     },
     leftAt: {
       type: Date,
@@ -45,8 +58,7 @@ const conversationSchema = new mongoose.Schema({
     sparse: true, // Only for groups
     default: function() {
       if (this.type === 'group') {
-        const { nanoid } = require('nanoid');
-        return 'KG' + nanoid(8);
+        return 'KG' + crypto.randomBytes(6).toString('hex');
       }
       return undefined;
     }
@@ -110,8 +122,24 @@ conversationSchema.virtual('activeParticipants').get(function() {
 // Method to check if user is participant
 conversationSchema.methods.hasParticipant = function(userId) {
   return this.participants.some(p => 
-    p.userId.toString() === userId.toString() && !p.leftAt
+    p.userId.toString() === userId.toString() && !p.leftAt && !p.isBanned
   );
+};
+
+// Method to get a participant's role
+conversationSchema.methods.getUserRole = function(userId) {
+  const p = this.participants.find(
+    p => p.userId.toString() === userId.toString() && !p.leftAt && !p.isBanned
+  );
+  return p ? p.role : null;
+};
+
+// Role hierarchy helper
+conversationSchema.statics.ROLE_RANK = { member: 0, moderator: 1, admin: 2, owner: 3 };
+
+conversationSchema.statics.canManage = function(actorRole, targetRole) {
+  const ranks = this.ROLE_RANK;
+  return (ranks[actorRole] || 0) > (ranks[targetRole] || 0);
 };
 
 // Method to add participant
@@ -120,6 +148,11 @@ conversationSchema.methods.addParticipant = function(userId, role = 'member') {
   const existingParticipant = this.participants.find(p => 
     p.userId.toString() === userId.toString()
   );
+
+  // Prevent banned users from being re-added
+  if (existingParticipant && existingParticipant.isBanned) {
+    return false;
+  }
   
   if (existingParticipant && existingParticipant.leftAt) {
     // Rejoin conversation
