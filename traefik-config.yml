@@ -27,8 +27,7 @@ http:
       headers:
         customRequestHeaders:
           X-Forwarded-Proto: "http"
-        # Ensure WebSocket upgrade headers pass through
-        # Traefik v3 handles WebSocket natively when not stripped
+          
     auth-strip-prefix:
       stripPrefix:
         prefixes:
