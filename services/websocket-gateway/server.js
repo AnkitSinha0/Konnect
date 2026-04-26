@@ -4,6 +4,7 @@ const { createServer } = require('http');
 const { Server } = require('socket.io');
 const redis = require('redis'); // Try original redis client instead of ioredis
 const jwt = require('jsonwebtoken');
+const { Kafka } = require('kafkajs');
 
 const app = express();
 const server = createServer(app);
@@ -618,6 +619,39 @@ const handleIncomingMessage = async (channel, message) => {
         break;
       }
 
+      case 'chat.moderation.lock': {
+        io.to(`conversation:${data.conversationId}`).emit('moderation:locked', {
+          conversationId: data.conversationId,
+          locked: true,
+          unlockTime: data.unlockTime,
+          triggeredBy: data.triggeredBy,
+          timestamp: data.timestamp,
+        });
+        console.log(`🔒 Group ${data.conversationId} manually locked by ${data.triggeredBy}`);
+        break;
+      }
+
+      case 'chat.moderation.unlock': {
+        io.to(`conversation:${data.conversationId}`).emit('moderation:unlocked', {
+          conversationId: data.conversationId,
+          locked: false,
+          triggeredBy: data.triggeredBy,
+          timestamp: data.timestamp,
+        });
+        console.log(`🔓 Group ${data.conversationId} manually unlocked by ${data.triggeredBy}`);
+        break;
+      }
+
+      case 'chat.moderation.reset': {
+        io.to(`conversation:${data.conversationId}`).emit('moderation:reset', {
+          conversationId: data.conversationId,
+          triggeredBy: data.triggeredBy,
+          timestamp: data.timestamp,
+        });
+        console.log(`🔄 Group ${data.conversationId} sentiment window reset by ${data.triggeredBy}`);
+        break;
+      }
+
       default:
         console.log(`❓ Unknown channel: ${channel}`);
     }
@@ -775,7 +809,10 @@ const start = async () => {
             'chat.member.banned',
             'chat.member.removed',
             'chat.member.muted',
-            'chat.member.unmuted'
+            'chat.member.unmuted',
+            'chat.moderation.lock',
+            'chat.moderation.unlock',
+            'chat.moderation.reset'
           ];
 
           for (const ch of channels) {
@@ -810,6 +847,109 @@ const start = async () => {
     } else {
       console.log('⚠️ No REDIS_URL provided - running in LOCAL-ONLY mode');
     }
+
+    // --- Kafka consumer for sentiment results ---
+    const kafkaBroker = process.env.KAFKA_BROKER || 'kafka:9092';
+    const sentimentTopic = process.env.KAFKA_SENTIMENT_TOPIC || 'sentiment_results';
+
+    try {
+      const kafka = new Kafka({
+        clientId: 'websocket-gateway',
+        brokers: [kafkaBroker],
+        retry: { initialRetryTime: 3000, retries: 15 },
+      });
+
+      const sentimentConsumer = kafka.consumer({ groupId: 'ws-sentiment-consumer' });
+
+      const connectWithRetry = async (retries = 10, delay = 5000) => {
+        for (let i = 1; i <= retries; i++) {
+          try {
+            console.log(`🔄 Connecting Kafka consumer (${i}/${retries})...`);
+            await sentimentConsumer.connect();
+            await sentimentConsumer.subscribe({ topic: sentimentTopic, fromBeginning: false });
+            console.log(`✅ Kafka consumer connected – listening on: ${sentimentTopic}`);
+            return true;
+          } catch (err) {
+            console.log(`⏳ Kafka not ready: ${err.message}, retrying in ${delay / 1000}s...`);
+            await new Promise(r => setTimeout(r, delay));
+          }
+        }
+        return false;
+      };
+
+      const kafkaConnected = await connectWithRetry();
+
+      if (kafkaConnected) {
+        await sentimentConsumer.run({
+          eachMessage: async ({ message }) => {
+            try {
+              const data = JSON.parse(message.value.toString());
+
+              if (data.type === 'per_message') {
+                // Per-message sentiment result – emit to the conversation room
+                io.to(`conversation:${data.conversationId}`).emit('sentiment:message', {
+                  messageId: data.messageId,
+                  conversationId: data.conversationId,
+                  senderId: data.senderId,
+                  sentiment: data.sentiment,
+                  sentiment_score: data.sentiment_score,
+                  toxicity: data.toxicity,
+                  flagged: data.flagged,
+                  timestamp: data.timestamp,
+                });
+
+                // If flagged, also notify moderators / admins
+                if (data.flagged) {
+                  io.to(`conversation:${data.conversationId}`).emit('moderation:flagged', {
+                    messageId: data.messageId,
+                    conversationId: data.conversationId,
+                    senderId: data.senderId,
+                    toxicity: data.toxicity,
+                    timestamp: data.timestamp,
+                  });
+                  console.log(`🚩 Flagged toxic message ${data.messageId} (toxicity: ${data.toxicity})`);
+                }
+
+              } else if (data.type === 'group_update') {
+                // Group aggregate update – emit to conversation room
+                io.to(`conversation:${data.conversationId}`).emit('sentiment:group', {
+                  conversationId: data.conversationId,
+                  avg_toxicity: data.avg_toxicity,
+                  negative_ratio: data.negative_ratio,
+                  moderation_score: data.moderation_score,
+                  avg_sentiment: data.avg_sentiment,
+                  mood: data.mood,
+                  status: data.status,
+                  locked: data.locked,
+                  unlockTime: data.unlockTime,
+                  timestamp: data.timestamp,
+                });
+
+                // If group was just auto-locked, emit a special event
+                if (data.lock_event) {
+                  io.to(`conversation:${data.conversationId}`).emit('moderation:locked', {
+                    conversationId: data.conversationId,
+                    moderation_score: data.moderation_score,
+                    unlockTime: data.unlockTime,
+                    timestamp: data.timestamp,
+                  });
+                  console.log(`🔒 Group ${data.conversationId} auto-locked (score: ${data.moderation_score})`);
+                }
+              }
+            } catch (err) {
+              console.error('❌ Error processing sentiment message:', err.message);
+            }
+          },
+        });
+        console.log('🧠 Sentiment pipeline active – real-time moderation enabled');
+      } else {
+        console.log('⚠️  Kafka consumer could not connect – sentiment features disabled');
+      }
+    } catch (kafkaError) {
+      console.error('⚠️  Kafka setup failed:', kafkaError.message);
+      console.log('⚠️  Continuing without sentiment features');
+    }
+
   } catch (error) {
     console.error('❌ WebSocket Gateway startup error:', error);
     // Don't exit - try to continue without Redis

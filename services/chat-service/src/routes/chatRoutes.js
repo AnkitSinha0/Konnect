@@ -20,7 +20,12 @@ const {
   unbanMember,
   leaveGroup,
   deleteMessage,
-  deleteGroup
+  deleteGroup,
+  getModerationStats,
+  getModerationHistory,
+  moderationLockGroup,
+  moderationUnlockGroup,
+  moderationResetWindow
 } = require('../controllers/chatController');
 
 // Public routes (no auth required)
@@ -54,5 +59,12 @@ router.delete('/groups/:groupId/members/:memberId', removeMember);
 router.patch('/groups/:groupId/members/:memberId/mute', muteMember);
 router.patch('/groups/:groupId/members/:memberId/ban', banMember);
 router.patch('/groups/:groupId/members/:memberId/unban', unbanMember);
+
+// Moderation routes
+router.get('/groups/:groupId/moderation/stats', getModerationStats);
+router.get('/groups/:groupId/moderation/history', getModerationHistory);
+router.post('/groups/:groupId/moderation/lock', moderationLockGroup);
+router.post('/groups/:groupId/moderation/unlock', moderationUnlockGroup);
+router.post('/groups/:groupId/moderation/reset', moderationResetWindow);
 
 module.exports = router;

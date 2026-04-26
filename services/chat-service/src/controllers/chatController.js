@@ -1,6 +1,8 @@
 const Message = require('../models/Message');
 const Conversation = require('../models/Conversation');
 const User = require('../models/User');
+const ModerationLog = require('../models/ModerationLog');
+const { publishMessage: kafkaPublish } = require('../config/kafka');
 
 // Redis client will be passed from server.js or imported from a shared module
 let redisClient;
@@ -48,6 +50,18 @@ const sendMessage = async (req, res) => {
         senderParticipant.isMuted = false;
         senderParticipant.mutedUntil = null;
         await conversation.save();
+      }
+
+      // Enforce moderation lock: only moderator+ can send when group is locked
+      if (redisClient) {
+        const lockKey = `sentiment:lock:${conversationId}`;
+        const isLocked = await redisClient.exists(lockKey) === 1;
+        if (isLocked) {
+          const senderRole = conversation.getUserRole(senderId);
+          if (!['moderator', 'admin', 'owner'].includes(senderRole)) {
+            return res.status(403).json({ error: 'Group is locked by moderation. Only moderators can send messages.' });
+          }
+        }
       }
     }
     
@@ -122,6 +136,20 @@ const sendMessage = async (req, res) => {
     } catch (redisError) {
       console.error('❌ Redis pub/sub failed:', redisError.message);
       // Continue anyway - message is still saved to database
+    }
+
+    // Publish to Kafka for sentiment analysis pipeline (non-blocking)
+    try {
+      await kafkaPublish({
+        messageId: message._id.toString(),
+        conversationId,
+        senderId,
+        content,
+        messageType,
+        timestamp: message.createdAt,
+      });
+    } catch (kafkaError) {
+      console.error('⚠️  Kafka publish failed:', kafkaError.message);
     }
     
     res.status(201).json({
@@ -696,7 +724,7 @@ const getGroupMembers = async (req, res) => {
     await conversation.populate({ path: 'participants.userId', select: 'name username email avatar', model: User });
 
     const members = conversation.participants
-      .filter(p => !p.leftAt && !p.isBanned)
+      .filter(p => !p.leftAt && !p.isBanned && p.userId)
       .map(p => ({
         userId: p.userId._id,
         name: p.userId.name,
@@ -713,7 +741,7 @@ const getGroupMembers = async (req, res) => {
     let bannedMembers = [];
     if (['admin', 'owner'].includes(callerRole)) {
       bannedMembers = conversation.participants
-        .filter(p => p.isBanned)
+        .filter(p => p.isBanned && p.userId)
         .map(p => ({
           userId: p.userId._id,
           name: p.userId.name,
@@ -1217,6 +1245,304 @@ const deleteGroup = async (req, res) => {
   }
 };
 
+/**
+ * Get moderation/lock history for a group
+ * GET /groups/:groupId/moderation/history
+ * Requires: moderator+
+ */
+const getModerationHistory = async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const actorId = req.userId;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+
+    const conversation = await Conversation.findById(groupId);
+    if (!conversation || conversation.type !== 'group') {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    const actorRole = conversation.getUserRole(actorId);
+    if (!actorRole) return res.status(403).json({ error: 'Not a member of this group' });
+
+    if (Conversation.ROLE_RANK[actorRole] < Conversation.ROLE_RANK['moderator']) {
+      return res.status(403).json({ error: 'Moderator access required' });
+    }
+
+    const logs = await ModerationLog.find({ conversationId: groupId })
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .populate('actorId', 'name username')
+      .lean();
+
+    res.json(logs);
+  } catch (error) {
+    console.error('Error getting moderation history:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Get moderation stats for a group
+ * GET /groups/:groupId/moderation/stats
+ * Requires: moderator+
+ */
+const getModerationStats = async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const actorId = req.userId;
+
+    const conversation = await Conversation.findById(groupId);
+    if (!conversation || conversation.type !== 'group') {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    const actorRole = conversation.getUserRole(actorId);
+    if (!actorRole) return res.status(403).json({ error: 'Not a member of this group' });
+
+    if (Conversation.ROLE_RANK[actorRole] < Conversation.ROLE_RANK['moderator']) {
+      return res.status(403).json({ error: 'Moderator access required' });
+    }
+
+    if (!redisClient) {
+      const redis = require('redis');
+      redisClient = redis.createClient({ url: process.env.REDIS_URL });
+      redisClient.on('error', (err) => console.log('Redis Client Error', err));
+      await redisClient.connect();
+    }
+
+    // Read sentiment window from Redis sorted set
+    const windowKey = `sentiment:window:${groupId}`;
+    const lockKey = `sentiment:lock:${groupId}`;
+
+    const rawEntries = await redisClient.zRange(windowKey, 0, -1);
+    const locked = await redisClient.exists(lockKey) === 1;
+    let unlockTime = null;
+
+    if (locked) {
+      const ttl = await redisClient.ttl(lockKey);
+      if (ttl > 0) {
+        unlockTime = Date.now() / 1000 + ttl;
+      }
+    }
+
+    if (!rawEntries || rawEntries.length === 0) {
+      return res.json({
+        avg_toxicity: 0, negative_ratio: 0, moderation_score: 0,
+        avg_sentiment: 0, mood: 'neutral', status: 'normal',
+        locked, unlockTime, window_size: 0
+      });
+    }
+
+    const entries = rawEntries.map(e => JSON.parse(e));
+    const avgToxicity = entries.reduce((s, e) => s + e.toxicity, 0) / entries.length;
+
+    const harmfulNeg = entries.filter(e => e.sentiment === 'NEGATIVE' && e.toxicity > 0.3).length;
+    const negativeRatio = harmfulNeg / entries.length;
+
+    let moderationScore = (0.7 * avgToxicity) + (0.3 * negativeRatio);
+    if (avgToxicity < 0.2) moderationScore = Math.min(moderationScore, 0.25);
+
+    const sentimentMap = { POSITIVE: 1, NEUTRAL: 0, NEGATIVE: -1 };
+    const avgSentiment = entries.reduce((s, e) => s + (sentimentMap[e.sentiment] || 0), 0) / entries.length;
+
+    const posRatio = entries.filter(e => e.sentiment === 'POSITIVE').length / entries.length;
+    const neutralRatio = entries.filter(e => e.sentiment === 'NEUTRAL').length / entries.length;
+
+    let mood = 'mixed';
+    if (posRatio > 0.6) mood = 'positive';
+    else if (negativeRatio > 0.4) mood = 'negative';
+    else if (neutralRatio > 0.5) mood = 'neutral';
+
+    let status = 'normal';
+    if (moderationScore >= 0.8) status = 'auto_lock';
+    else if (moderationScore >= 0.6) status = 'notify_moderator';
+    else if (moderationScore >= 0.3) status = 'warning';
+
+    res.json({
+      avg_toxicity: +avgToxicity.toFixed(4),
+      negative_ratio: +negativeRatio.toFixed(4),
+      moderation_score: +moderationScore.toFixed(4),
+      avg_sentiment: +avgSentiment.toFixed(4),
+      mood, status, locked, unlockTime,
+      window_size: entries.length
+    });
+  } catch (error) {
+    console.error('Error getting moderation stats:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Manually lock a group
+ * POST /groups/:groupId/moderation/lock
+ * Requires: moderator+
+ */
+const moderationLockGroup = async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const actorId = req.userId;
+    const { duration } = req.body; // optional: override duration in seconds
+
+    const conversation = await Conversation.findById(groupId);
+    if (!conversation || conversation.type !== 'group') {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    const actorRole = conversation.getUserRole(actorId);
+    if (!actorRole) return res.status(403).json({ error: 'Not a member of this group' });
+
+    if (Conversation.ROLE_RANK[actorRole] < Conversation.ROLE_RANK['moderator']) {
+      return res.status(403).json({ error: 'Moderator access required' });
+    }
+
+    if (!redisClient) {
+      const redis = require('redis');
+      redisClient = redis.createClient({ url: process.env.REDIS_URL });
+      redisClient.on('error', (err) => console.log('Redis Client Error', err));
+      await redisClient.connect();
+    }
+
+    const lockKey = `sentiment:lock:${groupId}`;
+    const lockDuration = (duration && Number.isInteger(duration) && duration > 0 && duration <= 86400)
+      ? duration : 1800;
+
+    await redisClient.setEx(lockKey, lockDuration, 'locked');
+    const unlockTime = Date.now() / 1000 + lockDuration;
+
+    // Log lock event
+    await ModerationLog.create({
+      conversationId: groupId,
+      action: 'lock',
+      triggeredBy: 'manual',
+      actorId,
+      duration: lockDuration
+    });
+
+    // Publish lock event so websocket-gateway can broadcast
+    await redisClient.publish('chat.moderation.lock', JSON.stringify({
+      conversationId: groupId,
+      locked: true,
+      unlockTime,
+      triggeredBy: actorId,
+      timestamp: Date.now()
+    }));
+
+    res.json({ success: true, locked: true, unlockTime, duration: lockDuration });
+  } catch (error) {
+    console.error('Error locking group:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Manually unlock a group
+ * POST /groups/:groupId/moderation/unlock
+ * Requires: moderator+
+ */
+const moderationUnlockGroup = async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const actorId = req.userId;
+
+    const conversation = await Conversation.findById(groupId);
+    if (!conversation || conversation.type !== 'group') {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    const actorRole = conversation.getUserRole(actorId);
+    if (!actorRole) return res.status(403).json({ error: 'Not a member of this group' });
+
+    if (Conversation.ROLE_RANK[actorRole] < Conversation.ROLE_RANK['moderator']) {
+      return res.status(403).json({ error: 'Moderator access required' });
+    }
+
+    if (!redisClient) {
+      const redis = require('redis');
+      redisClient = redis.createClient({ url: process.env.REDIS_URL });
+      redisClient.on('error', (err) => console.log('Redis Client Error', err));
+      await redisClient.connect();
+    }
+
+    const lockKey = `sentiment:lock:${groupId}`;
+    await redisClient.del(lockKey);
+
+    // Log unlock event
+    await ModerationLog.create({
+      conversationId: groupId,
+      action: 'unlock',
+      triggeredBy: 'manual',
+      actorId
+    });
+
+    // Publish unlock event
+    await redisClient.publish('chat.moderation.unlock', JSON.stringify({
+      conversationId: groupId,
+      locked: false,
+      triggeredBy: actorId,
+      timestamp: Date.now()
+    }));
+
+    res.json({ success: true, locked: false });
+  } catch (error) {
+    console.error('Error unlocking group:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Reset sentiment window for a group
+ * POST /groups/:groupId/moderation/reset
+ * Requires: admin+
+ */
+const moderationResetWindow = async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const actorId = req.userId;
+
+    const conversation = await Conversation.findById(groupId);
+    if (!conversation || conversation.type !== 'group') {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    const actorRole = conversation.getUserRole(actorId);
+    if (!actorRole) return res.status(403).json({ error: 'Not a member of this group' });
+
+    if (Conversation.ROLE_RANK[actorRole] < Conversation.ROLE_RANK['admin']) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+
+    if (!redisClient) {
+      const redis = require('redis');
+      redisClient = redis.createClient({ url: process.env.REDIS_URL });
+      redisClient.on('error', (err) => console.log('Redis Client Error', err));
+      await redisClient.connect();
+    }
+
+    const windowKey = `sentiment:window:${groupId}`;
+    await redisClient.del(windowKey);
+
+    // Log reset event
+    await ModerationLog.create({
+      conversationId: groupId,
+      action: 'reset',
+      triggeredBy: 'manual',
+      actorId
+    });
+
+    // Publish reset event
+    await redisClient.publish('chat.moderation.reset', JSON.stringify({
+      conversationId: groupId,
+      triggeredBy: actorId,
+      timestamp: Date.now()
+    }));
+
+    res.json({ success: true, message: 'Sentiment window reset' });
+  } catch (error) {
+    console.error('Error resetting sentiment window:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
 module.exports = {
   sendMessage,
   getMessages,
@@ -1237,5 +1563,10 @@ module.exports = {
   leaveGroup,
   deleteMessage,
   deleteGroup,
-  setRedisClient
+  setRedisClient,
+  getModerationStats,
+  getModerationHistory,
+  moderationLockGroup,
+  moderationUnlockGroup,
+  moderationResetWindow
 };

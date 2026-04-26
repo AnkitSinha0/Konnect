@@ -35,6 +35,40 @@ services:
       - "traefik.http.routers.dashboard.rule=Host(`traefik.localhost`) || PathPrefix(`/api`) || PathPrefix(`/dashboard`)"
       - "traefik.http.routers.dashboard.service=api@internal"
 
+  # Apache Kafka (KRaft mode - no Zookeeper)
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: konnect-kafka
+    environment:
+      # KRaft settings
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Listeners
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Cluster
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      # Topic defaults
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    ports:
+      - "9092:9092"
+    networks:
+      - konnect-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
   # Auth Service - connects to cloud MongoDB, Redis, RabbitMQ
   auth-service:
     build:
@@ -101,6 +135,7 @@ services:
       - konnect-network
     depends_on:
       - auth-service
+      - kafka
     labels:
       # Enable Traefik
       - "traefik.enable=true"
@@ -136,6 +171,26 @@ services:
       - "traefik.http.routers.websocket-gateway.entrypoints=web"
       # Service configuration
       - "traefik.http.services.websocket-gateway.loadbalancer.server.port=3004"
+
+  # Sentiment Analysis Service - Python ML pipeline
+  sentiment-service:
+    build:
+      context: ./services/sentiment-service
+      dockerfile: Dockerfile
+    env_file:
+      - ./services/sentiment-service/.env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    restart: unless-stopped
+    networks:
+      - konnect-network
+    depends_on:
+      kafka:
+        condition: service_healthy
 
 # Custom network
 networks:

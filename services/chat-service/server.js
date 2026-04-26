@@ -6,6 +6,7 @@ const cors = require('cors');
 const cookieParser = require('cookie-parser');
 const chatRoutes = require('./src/routes/chatRoutes');
 const { setRedisClient } = require('./src/controllers/chatController');
+const { connectProducer } = require('./src/config/kafka');
 
 // Register models (must be done before any route handlers)
 require('./src/models/User');
@@ -74,6 +75,13 @@ const start = async () => {
       
     } catch (redisError) {
       console.error('⚠️  Chat Service: Redis connection failed, continuing without pub/sub:', redisError.message);
+    }
+
+    // Connect Kafka producer for sentiment pipeline
+    try {
+      await connectProducer();
+    } catch (kafkaError) {
+      console.error('⚠️  Chat Service: Kafka connection failed, continuing without sentiment:', kafkaError.message);
     }
     
     app.listen(PORT, () => {
