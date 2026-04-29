@@ -10,12 +10,10 @@ import redis as redis_lib
 import os
 
 WINDOW_SIZE = int(os.getenv("SLIDING_WINDOW_SIZE", "50"))
-LOCK_COOLDOWN_SECONDS = 1800  # 30 minutes
+LOCK_COOLDOWN_SECONDS = 1800  
 
-# In-memory fallback
-_in_memory_windows = {}  # groupId -> list of { toxicity, sentiment, timestamp }
+_in_memory_windows = {}  
 
-# Redis client
 _redis = None
 
 
@@ -24,15 +22,15 @@ def init_redis():
     global _redis
     redis_url = os.getenv("REDIS_URL")
     if not redis_url:
-        print("⚠️  No REDIS_URL – aggregator using in-memory only")
+        print("No REDIS_URL – aggregator using in-memory only")
         return
 
     try:
         _redis = redis_lib.from_url(redis_url, decode_responses=True)
         _redis.ping()
-        print("✅ Aggregator: Redis connected for sliding window persistence")
+        print("Aggregator: Redis connected for sliding window persistence")
     except Exception as e:
-        print(f"⚠️  Aggregator: Redis connection failed ({e}), using in-memory fallback")
+        print(f"Aggregator: Redis connection failed ({e}), using in-memory fallback")
         _redis = None
 
 
@@ -63,11 +61,10 @@ def add_message_result(group_id: str, toxicity: float, sentiment_label: str, tim
             count = _redis.zcard(key)
             if count > WINDOW_SIZE:
                 _redis.zremrangebyrank(key, 0, count - WINDOW_SIZE - 1)
-            # Set TTL so stale groups don't persist forever (24h)
             _redis.expire(key, 86400)
             return
         except Exception as e:
-            print(f"⚠️  Redis write failed, falling back to memory: {e}")
+            print(f"Redis write failed, falling back to memory: {e}")
 
     # In-memory fallback
     if group_id not in _in_memory_windows:
@@ -98,22 +95,19 @@ def get_group_stats(group_id: str) -> dict:
     total_toxicity = sum(e["toxicity"] for e in entries)
     avg_toxicity = total_toxicity / len(entries)
 
-    # Count harmful negatives (negative AND toxicity > 0.3)
-    # This filters out harmless self-expressive negative messages
+    
     harmful_negative_count = sum(
         1 for e in entries
         if e["sentiment"] == "NEGATIVE" and e["toxicity"] > 0.3
     )
     negative_ratio = harmful_negative_count / len(entries)
 
-    # Moderation score: weighted combination
+    
     moderation_score = (0.7 * avg_toxicity) + (0.3 * negative_ratio)
 
-    # Safety floor: if avg toxicity is very low, cap escalation
     if avg_toxicity < 0.2:
         moderation_score = min(moderation_score, 0.25)
 
-    # Compute avg_sentiment using numeric mapping: +1 / 0 / -1
     _sentiment_value = {"POSITIVE": 1, "NEUTRAL": 0, "NEGATIVE": -1}
     avg_sentiment = sum(
         _sentiment_value.get(e["sentiment"], 0) for e in entries
@@ -179,10 +173,10 @@ def lock_group(group_id: str):
     if _redis:
         try:
             _redis.setex(_lock_key(group_id), LOCK_COOLDOWN_SECONDS, "locked")
-            print(f"🔒 Group {group_id} auto-locked for {LOCK_COOLDOWN_SECONDS}s")
+            print(f"Group {group_id} auto-locked for {LOCK_COOLDOWN_SECONDS}s")
             return
         except Exception as e:
-            print(f"⚠️  Failed to set lock in Redis: {e}")
+            print(f"Failed to set lock in Redis: {e}")
 
 
 def unlock_group(group_id: str):
@@ -190,7 +184,7 @@ def unlock_group(group_id: str):
     if _redis:
         try:
             _redis.delete(_lock_key(group_id))
-            print(f"🔓 Group {group_id} manually unlocked")
+            print(f"Group {group_id} manually unlocked")
         except Exception:
             pass
 
@@ -200,9 +194,9 @@ def reset_window(group_id: str):
     if _redis:
         try:
             _redis.delete(_redis_key(group_id))
-            print(f"🔄 Group {group_id} sliding window reset (Redis)")
+            print(f"Group {group_id} sliding window reset (Redis)")
         except Exception as e:
-            print(f"⚠️  Redis reset failed: {e}")
+            print(f"Redis reset failed: {e}")
     # Also clear in-memory fallback
     _in_memory_windows.pop(group_id, None)
 
@@ -215,7 +209,7 @@ def _get_window(group_id: str) -> list:
             raw_entries = _redis.zrange(key, 0, -1)
             return [json.loads(e) for e in raw_entries]
         except Exception as e:
-            print(f"⚠️  Redis read failed: {e}")
+            print(f"Redis read failed: {e}")
 
     # In-memory fallback
     return _in_memory_windows.get(group_id, [])
