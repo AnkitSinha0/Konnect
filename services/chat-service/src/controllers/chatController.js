@@ -1348,8 +1348,23 @@ const getModerationHistory = async (req, res) => {
     const logs = await ModerationLog.find(query)
       .sort({ createdAt: -1 })
       .limit(limit)
-      .populate('actorId', 'name username avatar')
       .lean();
+
+    // Manual cross-connection populate — User lives on authConn, default
+    // mongoose populate can't resolve it.
+    const actorIds = [...new Set(logs.map(l => l.actorId).filter(Boolean).map(String))];
+    if (actorIds.length) {
+      const actors = await User.find({ _id: { $in: actorIds } })
+        .select('name username avatar')
+        .lean();
+      const actorMap = new Map(actors.map(a => [String(a._id), a]));
+      for (const log of logs) {
+        if (log.actorId) {
+          const a = actorMap.get(String(log.actorId));
+          if (a) log.actorId = a;
+        }
+      }
+    }
 
     res.json(logs);
   } catch (error) {
