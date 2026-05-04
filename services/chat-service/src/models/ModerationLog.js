@@ -9,7 +9,7 @@ const moderationLogSchema = new mongoose.Schema({
   },
   action: {
     type: String,
-    enum: ['lock', 'unlock', 'reset'],
+    enum: ['lock', 'unlock', 'reset', 'export'],
     required: true
   },
   triggeredBy: {

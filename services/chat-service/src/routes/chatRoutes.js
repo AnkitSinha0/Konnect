@@ -25,7 +25,9 @@ const {
   getModerationHistory,
   moderationLockGroup,
   moderationUnlockGroup,
-  moderationResetWindow
+  moderationResetWindow,
+  getTopToxicUsers,
+  auditModerationExport
 } = require('../controllers/chatController');
 
 // Public routes (no auth required)
@@ -63,8 +65,10 @@ router.patch('/groups/:groupId/members/:memberId/unban', unbanMember);
 // Moderation routes
 router.get('/groups/:groupId/moderation/stats', getModerationStats);
 router.get('/groups/:groupId/moderation/history', getModerationHistory);
+router.get('/groups/:groupId/moderation/top-toxic', getTopToxicUsers);
 router.post('/groups/:groupId/moderation/lock', moderationLockGroup);
 router.post('/groups/:groupId/moderation/unlock', moderationUnlockGroup);
 router.post('/groups/:groupId/moderation/reset', moderationResetWindow);
+router.post('/groups/:groupId/moderation/audit-export', auditModerationExport);
 
 module.exports = router;

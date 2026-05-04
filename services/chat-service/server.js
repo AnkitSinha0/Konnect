@@ -7,11 +7,13 @@ const cookieParser = require('cookie-parser');
 const chatRoutes = require('./src/routes/chatRoutes');
 const { setRedisClient } = require('./src/controllers/chatController');
 const { connectProducer } = require('./src/config/kafka');
+const { startSentimentConsumer } = require('./src/config/sentimentConsumer');
 
 // Register models (must be done before any route handlers)
 require('./src/models/User');
 require('./src/models/Message');
 require('./src/models/Conversation');
+require('./src/models/FlaggedMessage');
 
 const app = express();
 const PORT = process.env.PORT || 3003;
@@ -83,6 +85,12 @@ const start = async () => {
     } catch (kafkaError) {
       console.error('⚠️  Chat Service: Kafka connection failed, continuing without sentiment:', kafkaError.message);
     }
+
+    // Start sentiment-results consumer (persists flagged messages for analytics)
+    // Fire-and-forget: don't block startup if Kafka is slow.
+    startSentimentConsumer().catch((err) =>
+      console.error('⚠️  Sentiment consumer init failed:', err.message)
+    );
     
     app.listen(PORT, () => {
       console.log(`🚀 Chat Service running on port ${PORT}`);

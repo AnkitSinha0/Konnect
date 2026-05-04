@@ -2,6 +2,7 @@ const Message = require('../models/Message');
 const Conversation = require('../models/Conversation');
 const User = require('../models/User');
 const ModerationLog = require('../models/ModerationLog');
+const FlaggedMessage = require('../models/FlaggedMessage');
 const { publishMessage: kafkaPublish } = require('../config/kafka');
 
 // Redis client will be passed from server.js or imported from a shared module
@@ -18,7 +19,7 @@ const setRedisClient = (client) => {
  */
 const sendMessage = async (req, res) => {
   try {
-    const { conversationId, content, messageType = 'text', metadata = {} } = req.body;
+    const { conversationId, content, messageType = 'text', metadata = {}, tempId } = req.body;
     const senderId = req.userId; // From JWT middleware
     
     if (!conversationId || !content) {
@@ -26,7 +27,25 @@ const sendMessage = async (req, res) => {
         error: 'conversationId and content are required' 
       });
     }
-    
+
+    // Idempotency: if a tempId is provided, dedup duplicate sends within 60s
+    // (prevents double-clicks, socket retries, multi-tab broadcasts)
+    if (tempId && redisClient) {
+      try {
+        const idemKey = `msg:idem:${senderId}:${tempId}`;
+        const existingId = await redisClient.get(idemKey);
+        if (existingId) {
+          console.log(`♻️  Duplicate send ignored (tempId=${tempId}, msgId=${existingId})`);
+          return res.status(200).json({
+            message: 'Duplicate ignored',
+            data: { messageId: existingId, conversationId, content, messageType, duplicate: true }
+          });
+        }
+      } catch (idemErr) {
+        console.warn('Idempotency check failed (continuing):', idemErr.message);
+      }
+    }
+
     // Verify conversation exists and user is participant
     const conversation = await Conversation.findById(conversationId);
     if (!conversation) {
@@ -81,6 +100,15 @@ const sendMessage = async (req, res) => {
     });
     
     await message.save();
+
+    // Record idempotency key now that the message has been persisted
+    if (tempId && redisClient) {
+      try {
+        await redisClient.set(`msg:idem:${senderId}:${tempId}`, message._id.toString(), { EX: 60 });
+      } catch (idemErr) {
+        console.warn('Idempotency set failed:', idemErr.message);
+      }
+    }
     
     // Update conversation's last message
     conversation.lastMessage = {
@@ -109,10 +137,22 @@ const sendMessage = async (req, res) => {
         messageType,
         timestamp: message.createdAt,
         senderInfo: {
-          name: req.userName || req.userEmail || senderId,
+          name: req.userName || req.userEmail || null,
           avatar: null
         }
       };
+
+      // If JWT didn't carry the name (legacy tokens), look it up from DB
+      // so the WebSocket payload never falls back to an ObjectId.
+      if (!eventData.senderInfo.name) {
+        try {
+          const sender = await User.findById(senderId).select('name username email').lean();
+          eventData.senderInfo.name = sender?.name || sender?.username || sender?.email || 'Unknown';
+        } catch (lookupErr) {
+          console.warn('Sender name lookup failed:', lookupErr.message);
+          eventData.senderInfo.name = 'Unknown';
+        }
+      }
       
       if (conversation.type === 'direct') {
         // 1:1 chat - find receiver
@@ -221,9 +261,24 @@ const getMessages = async (req, res) => {
     .limit(parseInt(limit));
     
     const total = await Message.countDocuments(messageQuery);
-    
+
+    // Build a set of user IDs who have left or been banned from this conversation
+    // so the client can render their messages as "former member".
+    const leftUserIds = new Set(
+      conversation.participants
+        .filter(p => p.leftAt || p.isBanned)
+        .map(p => p.userId.toString())
+    );
+
+    const messagesWithStatus = messages.reverse().map(m => {
+      const obj = m.toObject();
+      const senderIdStr = (obj.senderId?._id || obj.senderId)?.toString();
+      obj.senderLeft = senderIdStr ? leftUserIds.has(senderIdStr) : false;
+      return obj;
+    });
+
     res.json({
-      messages: messages.reverse(), // Most recent last for chat display
+      messages: messagesWithStatus, // Most recent last for chat display
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
@@ -1167,7 +1222,12 @@ const leaveGroup = async (req, res) => {
         senderId: userId,
         content: systemMessage.content,
         messageType: 'system',
-        timestamp: systemMessage.createdAt
+        timestamp: systemMessage.createdAt,
+        // Include the updated active participant count so clients can refresh
+        // their cached count without an extra API round-trip.
+        participantCount: conversation.activeParticipants.length,
+        systemEvent: 'member_left',
+        affectedUserId: userId.toString()
       }));
     } catch (redisError) {
       console.error('Redis publish failed for leave event:', redisError.message);
@@ -1255,6 +1315,9 @@ const getModerationHistory = async (req, res) => {
     const { groupId } = req.params;
     const actorId = req.userId;
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const before = req.query.before; // ISO timestamp for cursor pagination
+    const action = req.query.action;  // optional: lock | unlock | reset | export
+    const triggeredBy = req.query.triggeredBy; // optional: auto | manual
 
     const conversation = await Conversation.findById(groupId);
     if (!conversation || conversation.type !== 'group') {
@@ -1268,15 +1331,188 @@ const getModerationHistory = async (req, res) => {
       return res.status(403).json({ error: 'Moderator access required' });
     }
 
-    const logs = await ModerationLog.find({ conversationId: groupId })
+    const query = { conversationId: groupId };
+    if (action && ['lock', 'unlock', 'reset', 'export'].includes(action)) {
+      query.action = action;
+    }
+    if (triggeredBy && ['auto', 'manual'].includes(triggeredBy)) {
+      query.triggeredBy = triggeredBy;
+    }
+    if (before) {
+      const beforeDate = new Date(before);
+      if (!isNaN(beforeDate.getTime())) {
+        query.createdAt = { $lt: beforeDate };
+      }
+    }
+
+    const logs = await ModerationLog.find(query)
       .sort({ createdAt: -1 })
       .limit(limit)
-      .populate('actorId', 'name username')
+      .populate('actorId', 'name username avatar')
       .lean();
 
     res.json(logs);
   } catch (error) {
     console.error('Error getting moderation history:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Get the top toxic members for a group within a window.
+ * GET /groups/:groupId/moderation/top-toxic?days=7&limit=5&minFlags=3
+ * Requires: moderator+
+ *
+ * Ranking score = avg_toxicity * log10(flagged_count + 1)
+ * — punishes severity AND frequency, prevents single-message outliers
+ *   from dominating the leaderboard.
+ */
+const getTopToxicUsers = async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const actorId = req.userId;
+    const days = Math.min(Math.max(parseInt(req.query.days) || 7, 1), 90);
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 5, 1), 25);
+    const minFlags = Math.min(Math.max(parseInt(req.query.minFlags) || 3, 1), 50);
+
+    const conversation = await Conversation.findById(groupId);
+    if (!conversation || conversation.type !== 'group') {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    const actorRole = conversation.getUserRole(actorId);
+    if (!actorRole) return res.status(403).json({ error: 'Not a member of this group' });
+
+    if (Conversation.ROLE_RANK[actorRole] < Conversation.ROLE_RANK['moderator']) {
+      return res.status(403).json({ error: 'Moderator access required' });
+    }
+
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    const ConvId = require('mongoose').Types.ObjectId;
+
+    const agg = await FlaggedMessage.aggregate([
+      {
+        $match: {
+          conversationId: new ConvId(groupId),
+          createdAt: { $gte: since },
+        },
+      },
+      {
+        $group: {
+          _id: '$senderId',
+          avgToxicity: { $avg: '$toxicity' },
+          maxToxicity: { $max: '$toxicity' },
+          flaggedCount: {
+            $sum: { $cond: ['$flagged', 1, 0] },
+          },
+          totalCount: { $sum: 1 },
+          lastFlaggedAt: { $max: '$createdAt' },
+        },
+      },
+      {
+        $match: {
+          // require some volume so single outliers don't top the list
+          totalCount: { $gte: minFlags },
+        },
+      },
+      {
+        $addFields: {
+          // severity × frequency, log-scaled
+          score: {
+            $multiply: [
+              '$avgToxicity',
+              { $log10: { $add: ['$totalCount', 1] } },
+            ],
+          },
+        },
+      },
+      { $sort: { score: -1 } },
+      { $limit: limit },
+    ]);
+
+    // Resolve usernames from the auth-database User collection.
+    const userIds = agg.map((row) => row._id).filter(Boolean);
+    const users = userIds.length
+      ? await User.find({ _id: { $in: userIds } })
+          .select('_id name username avatar')
+          .lean()
+      : [];
+    const userMap = new Map(users.map((u) => [String(u._id), u]));
+
+    const ranked = agg.map((row, i) => {
+      const u = userMap.get(String(row._id)) || {};
+      return {
+        rank: i + 1,
+        userId: row._id,
+        name: u.name || null,
+        username: u.username || null,
+        avatar: u.avatar || null,
+        avgToxicity: +row.avgToxicity.toFixed(4),
+        maxToxicity: +row.maxToxicity.toFixed(4),
+        flaggedCount: row.flaggedCount,
+        totalCount: row.totalCount,
+        lastFlaggedAt: row.lastFlaggedAt,
+        score: +row.score.toFixed(4),
+      };
+    });
+
+    res.json({
+      windowDays: days,
+      generatedAt: new Date().toISOString(),
+      users: ranked,
+    });
+  } catch (error) {
+    console.error('Error computing top toxic users:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Audit a moderation data export.
+ * POST /groups/:groupId/moderation/audit-export
+ * Body: { type: 'history' | 'top-toxic' | 'full', rows: number, range?: string }
+ * Requires: moderator+
+ *
+ * Writes a ModerationLog entry of action='export' so admins can't quietly
+ * exfiltrate member toxicity data without a trail.
+ */
+const auditModerationExport = async (req, res) => {
+  try {
+    const { groupId } = req.params;
+    const actorId = req.userId;
+    const { type, rows, range } = req.body || {};
+
+    if (!['history', 'top-toxic', 'timeline', 'full'].includes(type)) {
+      return res.status(400).json({ error: 'Invalid export type' });
+    }
+
+    const conversation = await Conversation.findById(groupId);
+    if (!conversation || conversation.type !== 'group') {
+      return res.status(404).json({ error: 'Group not found' });
+    }
+
+    const actorRole = conversation.getUserRole(actorId);
+    if (!actorRole) return res.status(403).json({ error: 'Not a member of this group' });
+
+    if (Conversation.ROLE_RANK[actorRole] < Conversation.ROLE_RANK['moderator']) {
+      return res.status(403).json({ error: 'Moderator access required' });
+    }
+
+    await ModerationLog.create({
+      conversationId: groupId,
+      action: 'export',
+      triggeredBy: 'manual',
+      actorId,
+      metadata: {
+        type,
+        rows: typeof rows === 'number' ? rows : null,
+        range: typeof range === 'string' ? range.slice(0, 64) : null,
+      },
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error logging export audit:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 };
@@ -1568,5 +1804,7 @@ module.exports = {
   getModerationHistory,
   moderationLockGroup,
   moderationUnlockGroup,
-  moderationResetWindow
+  moderationResetWindow,
+  getTopToxicUsers,
+  auditModerationExport
 };
