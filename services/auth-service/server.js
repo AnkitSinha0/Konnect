@@ -44,23 +44,23 @@ const PORT = process.env.PORT || 3002;
 const start = async () => {
   try {
     await connectDB();
-    console.log('✅ Database connected successfully');
+    console.log('Database connected successfully');
   } catch (err) {
-    console.error('❌ Database connection failed:', err.message);
-    console.log('⚠️  Starting server without database connection...');
+    console.error('Database connection failed:', err.message);
+    console.log('Starting server without database connection...');
   }
 
   try {
     await connectRabbitMQ();
-    console.log('✅ RabbitMQ connected successfully');
+    console.log('RabbitMQ connected successfully');
   } catch (err) {
-    console.error('❌ RabbitMQ connection failed:', err.message);
-    console.log('⚠️  Starting server without RabbitMQ connection...');
+    console.error('RabbitMQ connection failed:', err.message);
+    console.log('Starting server without RabbitMQ connection...');
   }
 
   app.listen(PORT, () => {
-    console.log(`🚀 Auth service running on port ${PORT}`);
-    console.log(`📍 Environment: ${process.env.NODE_ENV}`);
+    console.log(`Auth service running on port ${PORT}`);
+    console.log(`Environment: ${process.env.NODE_ENV}`);
   });
 };
 
